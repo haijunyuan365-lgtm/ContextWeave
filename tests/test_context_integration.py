@@ -80,7 +80,7 @@ def test_chat_default_compatibility_and_opt_in_debug(monkeypatch, mode, expected
             return_value=SimpleNamespace(content=[{"type": "text", "text": "请参考退款政策。"}]))))
     mem = SimpleNamespace(get_lightweight_context=AsyncMock(return_value=LightweightContext()),
                           search_episodic=AsyncMock(), get_profile=AsyncMock(),
-                          add_message=AsyncMock(), update_profile=AsyncMock())
+                          add_message=AsyncMock(), update_profile=AsyncMock(), begin_turn=AsyncMock())
     docs = {"valid": [{"title": "policy", "content": "sensitive knowledge"}], "empty": [],
             "fallback": [{"content": "unavailable", "fallback": True}], "error": []}[mode]
     rag = SimpleNamespace(search_with_rewrite=AsyncMock(return_value=ToolResult(mode != "error", docs, "knowledge_search")))
@@ -119,7 +119,7 @@ def test_chat_reports_reactive_knowledge_even_without_preloading(monkeypatch):
     for agents in orch._pool.values():
         agents[0]._client = SimpleNamespace(messages=SimpleNamespace(create=create))
     mem = SimpleNamespace(get_lightweight_context=AsyncMock(return_value=LightweightContext()),
-                          add_message=AsyncMock(), update_profile=AsyncMock())
+                          add_message=AsyncMock(), update_profile=AsyncMock(), begin_turn=AsyncMock())
     rag = SimpleNamespace(search_with_rewrite=AsyncMock(return_value=ToolResult(
         True, [{"title": "退款", "content": "参考政策"}], "knowledge_search")))
     planner = SimpleNamespace(plan=AsyncMock(return_value=ContextPlan(need_skill=False)))

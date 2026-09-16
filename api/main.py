@@ -20,7 +20,7 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -189,15 +189,17 @@ async def lifespan(app: FastAPI):
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
+    await _memory.start()
     logger.info("EchoMind 已就绪")
-    yield
-
-    await _monitor.stop()
-    if _context_pipeline is not None:
-        await _context_pipeline.close()
-    if _memory is not None:
-        await _memory.close()
-    logger.info("EchoMind 已关闭")
+    try:
+        yield
+    finally:
+        await _monitor.stop()
+        if _memory is not None:
+            await _memory.close()
+        if _context_pipeline is not None:
+            await _context_pipeline.close()
+        logger.info("EchoMind 已关闭")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -299,6 +301,7 @@ async def chat(req: ChatRequest):
     conv_id = req.conv_id or str(uuid.uuid4())
 
     orch_req = OrcReq(message=req.message, user_id=req.user_id, conv_id=conv_id)
+    source = await _memory.begin_turn(req.user_id, conv_id, req.message)
     intent_result = await _context_pipeline.prepare(orch_req)
     try:
         result = await _orchestrator.run(orch_req)
@@ -307,11 +310,8 @@ async def chat(req: ChatRequest):
         await orch_req.retrieval_session.close()
 
     # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
-
-    # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message, source=source)
+    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
 
     return ChatResponse(
         conv_id=conv_id,
@@ -334,6 +334,27 @@ async def chat(req: ChatRequest):
         intent_source_scores=intent_result.source_scores,
         **({"context_debug": context_debug(orch_req)} if req.debug_context else {}),
     )
+
+
+@app.get("/memory/{user_id}/events", tags=["Memory"])
+async def memory_events(user_id: str, limit: int = Query(50, ge=1, le=200)):
+    if _memory is None:
+        raise HTTPException(503, "记忆服务未就绪")
+    return {"user_id": user_id, "events": await _memory.memory_events(user_id, limit)}
+
+
+@app.get("/memory/{user_id}/status", tags=["Memory"])
+async def memory_status(user_id: str):
+    if _memory is None:
+        raise HTTPException(503, "记忆服务未就绪")
+    return await _memory.memory_status(user_id)
+
+
+@app.get("/memory/{user_id}", tags=["Memory"])
+async def inspect_memory(user_id: str):
+    if _memory is None:
+        raise HTTPException(503, "记忆服务未就绪")
+    return await _memory.inspect_memory(user_id)
 
 
 @app.get("/monitor")
@@ -580,33 +601,37 @@ async def _cli():
 
     user_id, conv_id = "cli_user", str(uuid.uuid4())
     pipeline = _make_context_pipeline(orch, mem, None, skill_manager, cfg)
+    await mem.start()
 
-    while True:
-        try:
-            msg = input("你: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见 ʕ•ᴥ•ʔ")
-            break
-        if not msg or msg.lower() in ("quit", "exit", "退出"):
-            print("再见 ʕ•ᴥ•ʔ")
-            break
+    try:
+        while True:
+            try:
+                msg = (await asyncio.to_thread(input, "你: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见 ʕ•ᴥ•ʔ")
+                break
+            if not msg or msg.lower() in ("quit", "exit", "退出"):
+                print("再见 ʕ•ᴥ•ʔ")
+                break
 
-        req = Request(message=msg, user_id=user_id, conv_id=conv_id)
-        await pipeline.prepare(req)
-        try:
-            result = await orch.run(req)
-        finally:
-            from core.context_runtime import log_context
-            log_context(req)
-            await req.retrieval_session.close()
+            req = Request(message=msg, user_id=user_id, conv_id=conv_id)
+            source = await mem.begin_turn(user_id, conv_id, msg)
+            await pipeline.prepare(req)
+            try:
+                result = await orch.run(req)
+            finally:
+                from core.context_runtime import log_context
+                log_context(req)
+                await req.retrieval_session.close()
 
-        await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
-        await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
+            await mem.add_message(user_id, conv_id, MsgRole.USER, msg, source=source)
+            await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
 
-        print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+            print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
 
-    await mem.close()
-    await pipeline.close()
+    finally:
+        await mem.close()
+        await pipeline.close()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ EchoMind 是一个面向客服/运营场景的多 Agent 智能系统。它不是
 - 路由驱动的多 Agent 编排
 - 意图驱动 RAG 检索
 - Redis + ChromaDB 分层记忆
+- Memory Evolution：带来源、版本和冲突处理的结构化长期记忆
 - 动态 Skills 注入
 - 在线监控与路由降权
 - LLM-as-Judge 端到端评测
@@ -91,7 +92,7 @@ docker compose logs -f echomind
 
 最近 5 条消息和最多 800 字摘要参与意图识别，再规划是否读取情景记忆、画像、知识和 Skill。
 同轮预检索和 Agent 补查共享缓存；多个 Agent 并发查询相同来源、query 和参数时只执行一次。
-Experience 仅预留接口；画像更新与记忆压缩仍沿用原流程，后台更新不受读取规划限制。
+Experience 仅预留接口；画像通过 Memory Evolution 在后台演化，读取规划不限制后台维护。
 
 调试请求示例：
 
@@ -118,6 +119,22 @@ ECHOMIND_PLANNER_TIMEOUT_SECONDS=5
 ```
 
 完整设计、演示场景和兼容边界见 [Context Planner 使用与设计](wiki/ContextPlanner.md)。
+
+### Memory Evolution
+
+用户消息先生成可验证的 `MemoryCandidate`，再由确定性 Resolver 执行 `CREATE / UPDATE / MERGE / SKIP`。
+支持退款方式等单值偏好、常用产品和长期技术环境；新偏好按来源消息顺序覆盖，更新保留旧值、版本和来源。
+
+明确偏好立即触发后台任务，其他新增用户消息累计 5 轮再提炼。结果在后台完成后的后续请求中生效。
+待处理消息独立保存在 Redis，写入 Chroma `user_memory` 快照成功后才确认；旧 `user_profile` 保留并兼容读取。
+
+内部只读调试入口：
+
+- `GET /memory/{user_id}`：有效画像、结构化记录及旧画像。
+- `GET /memory/{user_id}/events?limit=50`：演化事件，最多 200 条。
+- `GET /memory/{user_id}/status`：待处理数量、运行状态、最近成功时间和错误类别。
+
+配置、演示和单进程并发边界见 [Memory Evolution 使用与设计](docs/MemoryEvolution.md)。
 
 ### 知识库
 
@@ -146,6 +163,8 @@ core/context_planner.py      规则与 LLM 上下文规划
 core/context_runtime.py      Bundle、请求内检索缓存和共享准备流程
 core/skill_loader.py         动态 Skills 加载
 memory/conversation_memory.py  Redis + ChromaDB 记忆
+memory/evolution.py          候选校验、字段注册表、确定性 Resolver
+memory/evolution_runtime.py  持久化快照、后台调度和恢复
 mcp/tool_manager.py          工具层、缓存、熔断、重排
 mcp/knowledge_base.py        ChromaDB 知识库
 monitor/performance_monitor.py 在线监控
@@ -166,7 +185,8 @@ data/                       持久化数据
   -> Selective Retrieval + ContextBundle
   -> AgentOrchestrator 路由到 General / Technical / Billing / Escalation
   -> 按角色注入 Skills、知识/记忆/画像运行时补查、回复生成
-  -> 写回 Redis 和 ChromaDB
+  -> 写回工作记忆，用户证据进入独立 Redis 待处理缓冲
+  -> 后台候选提取、冲突处理与 Chroma 结构化记忆演化
   -> Monitor 采集在线指标
   -> Evaluator 做意图识别和回复质量评测
 ```
