@@ -119,57 +119,26 @@ class SkillManager:
         """运行时热加载入口，供 API 调用。"""
         return self.load()
 
-    def prompt_for(self, message: str, agent_type: Optional[str] = None) -> str:
-        """
-        为当前用户请求构建 Skill prompt。
+    def select(self, message: str, agent_type: Optional[str] = None) -> List[Skill]:
+        """Snapshot candidates for one request; role filtering can happen after routing."""
+        return [skill for skill in self._skills if skill.matches(message, agent_type)]
 
-        只注入匹配的 Skill，并按总长度截断，避免挤占主对话上下文。
-        """
+    def format_skills(self, skills: List[Skill]) -> str:
         blocks: List[str] = []
-        matched: List[tuple[Skill, List[str]]] = []
         remaining = self.max_prompt_chars
-        lowered_message = (message or "").lower()
-
-        for skill in self._skills:
-            if not skill.matches(message, agent_type):
-                continue
-            matched_keywords = [
-                keyword for keyword in skill.keywords
-                if keyword.lower() in lowered_message
-            ]
-            block = skill.to_prompt_block()
-            if len(block) > remaining:
-                block = block[:remaining].rstrip() + "\n..."
-            blocks.append(block)
-            matched.append((skill, matched_keywords))
-            remaining -= len(block)
+        for skill in skills:
             if remaining <= 0:
                 break
-
+            block = skill.to_prompt_block()[:remaining]
+            blocks.append(block)
+            remaining -= len(block)
         if not blocks:
-            logger.debug(
-                "Skills 未命中: agent=%s message=%r",
-                agent_type or "all",
-                (message or "")[:80],
-            )
             return ""
+        return "以下是当前请求可用的 EchoMind Skills；与系统角色冲突时以系统角色和安全边界为准。\n\n" + "\n\n".join(blocks)
 
-        detail = "; ".join(
-            f"{skill.name}(keywords={', '.join(keywords) if keywords else 'all'})"
-            for skill, keywords in matched
-        )
-        logger.info(
-            "Skills 已注入: agent=%s matched=%s message=%r",
-            agent_type or "all",
-            detail,
-            (message or "")[:80],
-        )
-
-        return (
-            "以下是当前请求可用的 EchoMind Skills。"
-            "请优先遵循这些业务规则；如果与系统角色冲突，以系统角色和安全边界为准。\n\n"
-            + "\n\n".join(blocks)
-        )
+    def prompt_for(self, message: str, agent_type: Optional[str] = None) -> str:
+        """Compatibility entrypoint using the same selection/formatting as ContextBundle."""
+        return self.format_skills(self.select(message, agent_type))
 
     def summary(self) -> Dict[str, Any]:
         """返回 Skill 管理器状态，用于 /skills 接口和排障。"""

@@ -173,13 +173,14 @@ class IntentRecognizer:
         self,
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
+        summary: str = "",
     ) -> IntentResult:
         """
         识别用户意图。
 
         history 格式：[{"role": "user"/"assistant", "content": "..."}]
         """
-        key = self._cache_key(message, history)
+        key = self._cache_key(message, history, summary)
         if key in self._cache:
             self.cache_hits += 1
             return self._cache[key]
@@ -188,7 +189,7 @@ class IntentRecognizer:
         t0 = time.monotonic()
 
         # LLM 和 Embedding 并行（Embedding 不可用时跳过）
-        llm_task = asyncio.create_task(self._llm_recognize(message, history))
+        llm_task = asyncio.create_task(self._llm_recognize(message, history, summary))
         emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
         pat      = self._pattern_recognize(message)
 
@@ -235,6 +236,7 @@ class IntentRecognizer:
         self,
         message: str,
         history: Optional[List[Dict[str, str]]],
+        summary: str = "",
     ) -> Dict[str, Any]:
         """策略 1：LLM 语义理解（Few-shot + 上下文）。"""
         message = self._clean_text(message)
@@ -244,12 +246,12 @@ class IntentRecognizer:
             for cat, tpls in _TEMPLATES.items()
             for t in tpls[:1]  # 每类取 1 条，控制 prompt 长度
         )
-        # 最近 3 轮对话上下文
-        ctx = ""
+        # 既有摘要和最近 5 条消息
+        ctx = "\n会话摘要:\n" + self._clean_text(summary)[:800] if summary else ""
         if history:
-            ctx = "\n最近对话:\n" + "\n".join(
+            ctx += "\n最近对话:\n" + "\n".join(
                 f"  {self._clean_text(m.get('role', 'user'))}: {self._clean_text(m.get('content', ''))}"
-                for m in history[-3:]
+                for m in history[-5:]
             )
 
         prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
@@ -450,15 +452,15 @@ class IntentRecognizer:
             return UrgencyLevel.MEDIUM
         return UrgencyLevel.LOW
 
-    def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        payload = {"message": self._clean_text(message)[:200]}
+    def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None, summary: str = "") -> str:
+        payload = {"message": self._clean_text(message), "summary": self._clean_text(summary)[:800]}
         if history:
             payload["history"] = [
                 {
                     "role": self._clean_text(item.get("role", ""))[:20],
-                    "content": self._clean_text(item.get("content", ""))[:160],
+                    "content": self._clean_text(item.get("content", "")),
                 }
-                for item in history[-3:]
+                for item in history[-5:]
             ]
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.md5(raw.encode("utf-8")).hexdigest()

@@ -49,6 +49,15 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_context_pipeline = None
+
+
+def _make_context_pipeline(orchestrator, memory, knowledge, skills, cfg):
+    from anthropic import AsyncAnthropic
+    from core.context_planner import ContextPlanner
+    from core.context_runtime import ContextPipeline
+    client = AsyncAnthropic(**{k: v for k, v in cfg.items() if k != "model"})
+    return ContextPipeline(orchestrator, ContextPlanner(client, cfg["model"]), memory, knowledge, skills)
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -66,7 +75,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _context_pipeline
 
     print(BANNER, flush=True)
 
@@ -157,6 +166,7 @@ async def lifespan(app: FastAPI):
     ))
     if _orchestrator is not None:
         _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
+    _context_pipeline = _make_context_pipeline(_orchestrator, _memory, _tool_manager, _skill_manager, cfg)
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -183,6 +193,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await _monitor.stop()
+    if _context_pipeline is not None:
+        await _context_pipeline.close()
     if _memory is not None:
         await _memory.close()
     logger.info("EchoMind 已关闭")
@@ -209,6 +221,7 @@ class ChatRequest(BaseModel):
     message:     str
     user_id:     str = "anonymous"
     conv_id:     Optional[str] = None
+    debug_context: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -230,6 +243,7 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    context_debug: Optional[Dict[str, Any]] = None
 
 
 class ToolTraceResponse(BaseModel):
@@ -269,47 +283,28 @@ async def reload_skills():
     return _skill_manager.summary()
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse, response_model_exclude_unset=True)
 async def chat(req: ChatRequest):
     """ 
     主对话接口。完整流程：
-      记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
+      轻量上下文 → 意图识别 → 规划与按需检索 → Agent 执行/补查 → 记忆写入
     """
-    if _orchestrator is None or _memory is None:
+    if _orchestrator is None or _memory is None or _context_pipeline is None:
         raise HTTPException(503, "服务未就绪")
 
     from agents.agent_orchestrator import Request as OrcReq
     from memory.conversation_memory import MsgRole
+    from core.context_runtime import context_debug, log_context
 
     conv_id = req.conv_id or str(uuid.uuid4())
 
-    # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
-
-    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
-    history = [
-        {"role": m.role.value, "content": m.content}
-        for m in mem_ctx.recent_messages[-5:]
-    ] if mem_ctx.recent_messages else None
-
-    intent_result = await _orchestrator.recognize_intent(req.message, history=history)
-    full_context = mem_ctx.to_prompt_text()
-
-    orch_req = OrcReq(
-        message=req.message,
-        user_id=req.user_id,
-        conv_id=conv_id,
-        context=full_context,
-        history=history,
-        entities=intent_result.entities,
-        intent=intent_result.intent,
-        intent_group=intent_result.intent_group,
-        urgency=intent_result.urgency,
-        intent_confidence=intent_result.confidence,
-    )
-
-    # 3. 执行
-    result = await _orchestrator.run(orch_req)
+    orch_req = OrcReq(message=req.message, user_id=req.user_id, conv_id=conv_id)
+    intent_result = await _context_pipeline.prepare(orch_req)
+    try:
+        result = await _orchestrator.run(orch_req)
+    finally:
+        log_context(orch_req)
+        await orch_req.retrieval_session.close()
 
     # 4. 写入记忆
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
@@ -333,73 +328,12 @@ async def chat(req: ChatRequest):
         routing_confidence=result.routing_confidence,
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
-        knowledge_used="search_knowledge_base" in result.tools_used,
+        knowledge_used=orch_req.retrieval_session.knowledge_used,
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
+        **({"context_debug": context_debug(orch_req)} if req.debug_context else {}),
     )
-
-
-async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) -> tuple[str, bool]:
-    """
-    为 /chat 主链路构建 RAG 知识上下文。
-
-    这里复用 MCPToolManager 的查询改写、并行召回、重排、fallback 能力。
-    """
-    if _tool_manager is None:
-        return "", False
-    if not _should_use_knowledge(message, intent=intent):
-        return "", False
-    try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
-        if not result.success or not isinstance(result.data, list) or not result.data:
-            return "", False
-
-        parts = ["[知识库检索结果]"]
-        used = False
-        for i, item in enumerate(result.data[:top_k], start=1):
-            if not isinstance(item, dict):
-                continue
-            title = str(item.get("title", "未命名文档"))
-            content = str(item.get("content", "")).strip()
-            score = item.get("score", "")
-            if not content:
-                continue
-            used = True
-            parts.append(f"{i}. 标题: {title}\n   相关度: {score}\n   内容: {content[:600]}")
-
-        if not used:
-            return "", False
-        parts.append("请优先依据以上知识库内容回答；如果知识库内容不足，再结合通用客服能力说明。")
-        return "\n".join(parts), True
-    except Exception as ex:
-        logger.warning(f"构建知识库上下文失败: {ex}")
-        return "", False
-
-
-def _should_use_knowledge(message: str, intent=None) -> bool:
-    """跳过纯寒暄，业务类问题才检索知识库，避免无关 RAG 干扰回复。"""
-    msg = (message or "").strip().lower()
-    if not msg:
-        return False
-    intent_value = getattr(intent, "value", intent)
-    if intent_value in {"greeting", "feedback", "escalation", "human_handoff", "other"}:
-        return False
-    if intent_value in {
-        "query", "request", "technical", "billing", "account", "complaint",
-        "order_status", "logistics", "refund", "invoice", "payment_issue",
-        "account_security", "technical_login", "technical_crash",
-    }:
-        return True
-    greetings = {"你好", "您好", "嗨", "hi", "hello", "hey", "早上好", "晚上好"}
-    if msg in greetings:
-        return False
-    business_keywords = [
-        "退款", "订单", "物流", "配送", "发票", "扣款", "支付", "账单", "订阅",
-        "登录", "报错", "错误", "崩溃", "会员", "积分", "账户", "密码", "地址",
-        "refund", "order", "invoice", "payment", "error", "login",
-    ]
-    return len(msg) >= 4 or any(kw in msg for kw in business_keywords)
 
 
 @app.get("/monitor")
@@ -645,6 +579,7 @@ async def _cli():
     )
 
     user_id, conv_id = "cli_user", str(uuid.uuid4())
+    pipeline = _make_context_pipeline(orch, mem, None, skill_manager, cfg)
 
     while True:
         try:
@@ -656,13 +591,14 @@ async def _cli():
             print("再见 ʕ•ᴥ•ʔ")
             break
 
-        ctx = await mem.get_context(user_id, conv_id, query=msg)
-        history = [
-            {"role": m.role.value, "content": m.content}
-            for m in ctx.recent_messages[-5:]
-        ] if ctx.recent_messages else None
-        req = Request(message=msg, user_id=user_id, conv_id=conv_id, context=ctx.to_prompt_text(), history=history)
-        result = await orch.run(req)
+        req = Request(message=msg, user_id=user_id, conv_id=conv_id)
+        await pipeline.prepare(req)
+        try:
+            result = await orch.run(req)
+        finally:
+            from core.context_runtime import log_context
+            log_context(req)
+            await req.retrieval_session.close()
 
         await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
@@ -670,6 +606,7 @@ async def _cli():
         print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
 
     await mem.close()
+    await pipeline.close()
 
 
 if __name__ == "__main__":

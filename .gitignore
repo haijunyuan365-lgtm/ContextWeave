@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv-win/
 venv/
 
 # 环境变量（含敏感信息）

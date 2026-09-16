@@ -179,9 +179,16 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
 
     async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         query = str(args.get("query") or req.message or "").strip()
-        top_k = int(args.get("top_k", 5) or 5)
+        top_k = args.get("top_k", 5)
         if not query:
             return {"success": False, "error": "query 不能为空", "results": []}
+        if req.retrieval_session is not None:
+            result = await req.retrieval_session.retrieve("knowledge", query, top_k)
+            data = result.data or []
+            req.retrieval_session.mark_knowledge_delivered(data)
+            return {"success": result.status in {"success", "empty", "degraded"},
+                    "query": query, "top_k": top_k, "results": data,
+                    "cached": result.cached, "reranked": result.reranked, "error": result.error}
         if tool_manager is None:
             return {"success": False, "error": "RAG 工具未初始化", "results": []}
 
@@ -218,6 +225,31 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             search_knowledge_base,
             required=["query"],
         )
+    }
+
+
+def build_context_tools() -> Dict[str, AgentToolSpec]:
+    async def search_memory(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        if req.retrieval_session is None:
+            return {"success": False, "error": "当前请求未配置记忆检索", "results": []}
+        result = await req.retrieval_session.retrieve(
+            "memory", args.get("query") or req.message, args.get("top_k", 5))
+        return {"success": result.status in {"success", "empty"}, "results": result.data or [],
+                "cached": result.cached, "error": result.error}
+
+    async def get_profile(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        if req.retrieval_session is None:
+            return {"success": False, "error": "当前请求未配置画像检索", "profile": {}}
+        result = await req.retrieval_session.retrieve("profile")
+        return {"success": result.status in {"success", "empty"}, "profile": result.data or {},
+                "cached": result.cached, "error": result.error}
+
+    return {
+        "search_conversation_memory": make_tool(
+            "search_conversation_memory", "只读检索当前用户历史；结果不代表实时业务状态。",
+            {"query": {"type": "string"}, "top_k": {"type": "integer"}}, search_memory, ["query"]),
+        "get_user_profile": make_tool(
+            "get_user_profile", "只读获取当前用户偏好画像，不查询订单、退款等业务状态。", {}, get_profile),
     }
 
 

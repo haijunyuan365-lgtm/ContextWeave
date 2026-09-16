@@ -33,6 +33,7 @@ from anthropic import AsyncAnthropic
 from agents.tools import (
     AgentToolSpec,
     build_shared_rag_tools,
+    build_context_tools,
     billing_tools,
     escalation_tools,
     general_tools,
@@ -40,6 +41,8 @@ from agents.tools import (
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+from core.context_planner import ContextPlan
+from core.context_runtime import ContextBundle, RetrievalSession
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +137,9 @@ class Request:
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    context_plan: Optional[ContextPlan] = None
+    context_bundle: Optional[ContextBundle] = None
+    retrieval_session: Optional[RetrievalSession] = None
 
 
 @dataclass
@@ -191,8 +197,6 @@ class BaseAgent:
         self._model  = self.profile.model or model
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
-        self._last_tools_used: List[str] = []
-        self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
@@ -205,10 +209,10 @@ class BaseAgent:
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
-        self._last_tools_used = []
-        self._last_tool_traces = []
+        tools_used: List[str] = []
+        tool_traces: List[Dict[str, Any]] = []
         try:
-            content = await self._call_llm(req)
+            content = await self._call_llm(req, tools_used, tool_traces)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
@@ -219,8 +223,8 @@ class BaseAgent:
                 success=True,
                 latency_ms=ms,
                 escalate=escalate,
-                tools_used=list(self._last_tools_used),
-                tool_traces=list(self._last_tool_traces),
+                tools_used=list(tools_used),
+                tool_traces=list(tool_traces),
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -231,10 +235,12 @@ class BaseAgent:
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
-                tool_traces=list(self._last_tool_traces),
+                tools_used=list(tools_used),
+                tool_traces=list(tool_traces),
             )
 
-    async def _call_llm(self, req: Request) -> str:
+    async def _call_llm(self, req: Request, tools_used: Optional[List[str]] = None,
+                        tool_traces: Optional[List[Dict[str, Any]]] = None) -> str:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -253,8 +259,8 @@ class BaseAgent:
         messages.append({"role": "user", "content": _clean(req.message)})
 
         tools = self.get_tools()
-        tools_used: List[str] = []
-        tool_traces: List[Dict[str, Any]] = []
+        tools_used = tools_used if tools_used is not None else []
+        tool_traces = tool_traces if tool_traces is not None else []
         for _ in range(3):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -273,9 +279,10 @@ class BaseAgent:
                     for spec in tools.values()
                 ]
             resp = await self._client.messages.create(**request_kwargs)
+            if req.retrieval_session is not None and req.context_bundle is not None:
+                req.retrieval_session.mark_knowledge_delivered(req.context_bundle.knowledge)
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
-                self._last_tools_used = tools_used
                 return extract_text_content(resp.content)
 
             messages.append({"role": "assistant", "content": resp.content})
@@ -331,8 +338,6 @@ class BaseAgent:
                 })
             messages.append({"role": "user", "content": tool_results})
 
-        self._last_tools_used = tools_used
-        self._last_tool_traces = tool_traces
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
 
     @staticmethod
@@ -377,8 +382,13 @@ class BaseAgent:
             f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
             f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
             "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
+            "背景不足时可使用知识、历史记忆和画像只读工具补查；未预加载不表示禁止查询。"
+            "历史记忆和画像仅供参考，不能证明当前订单、退款或余额状态。"
         )
         base_prompt = f"{self.system_prompt}{profile_prompt}"
+        if req.context_bundle is not None:
+            skill_prompt = req.context_bundle.skill_prompt_for(self.agent_type.value)
+            return f"{base_prompt}\n\n[动态 Skills]\n{skill_prompt}" if skill_prompt else base_prompt
         if self._skill_manager is None:
             return base_prompt
         skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
@@ -413,7 +423,7 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields"),
+        tool_scope=("search_knowledge_base", "search_conversation_memory", "get_user_profile", "inspect_request_context", "suggest_required_fields"),
         temperature=0.3,
         max_tokens=900,
     )
@@ -443,7 +453,7 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证结果", "需要补充的信息"),
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan"),
+        tool_scope=("search_knowledge_base", "search_conversation_memory", "get_user_profile", "lookup_error_code", "build_diagnostic_plan"),
         temperature=0.1,
         max_tokens=1200,
     )
@@ -476,7 +486,7 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
+        tool_scope=("search_knowledge_base", "search_conversation_memory", "get_user_profile", "check_billing_fields", "compare_amounts"),
         temperature=0.0,
         max_tokens=1100,
     )
@@ -522,7 +532,7 @@ class EscalationAgent(BaseAgent):
         input_contract=("用户消息", "意图", "紧急度", "结构化实体", "对话背景"),
         output_contract=("升级原因", "已知信息摘要", "还需补充的信息", "保守的后续说明"),
         handoff_conditions=("用户明确要求人工", "紧急或高风险场景"),
-        tool_scope=("search_knowledge_base", "create_handoff_summary"),
+        tool_scope=("search_knowledge_base", "search_conversation_memory", "get_user_profile", "create_handoff_summary"),
         temperature=0.0,
         max_tokens=500,
     )
@@ -586,8 +596,9 @@ class ResponseComposer:
             f"用户问题：{req.message}\n"
             f"候选结果：\n{evidence}"
         )
-        if self._skill_manager is not None:
-            skill = self._skill_manager.prompt_for(req.message, "general")
+        if req.context_bundle is not None or self._skill_manager is not None:
+            skill = (req.context_bundle.skill_prompt_for("general") if req.context_bundle is not None
+                     else self._skill_manager.prompt_for(req.message, "general"))
             if skill:
                 prompt += f"\n\n[通用客服输出边界]\n{skill}"
         try:
@@ -694,6 +705,7 @@ class AgentOrchestrator:
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         """更新所有 Agent 共享的工具白名单。"""
         self._shared_tools = dict(tools or {})
+        self._shared_tools.update(build_context_tools())
         for agents in self._pool.values():
             for agent in agents:
                 agent.set_shared_tools(self._shared_tools)
@@ -702,9 +714,10 @@ class AgentOrchestrator:
         self,
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
+        summary: str = "",
     ):
         """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
-        return await self._intent_recognizer.recognize(message, history=history)
+        return await self._intent_recognizer.recognize(message, history=history, summary=summary)
 
     def _record_tool_trace(self, result: OrchestratorResult) -> None:
         trace = {

@@ -3,6 +3,7 @@
 EchoMind 是一个面向客服/运营场景的多 Agent 智能系统。它不是单纯的聊天机器人，而是把以下能力串成闭环：
 
 - 细粒度意图识别
+- 规则优先、LLM 兜底的 Context Planner
 - 路由驱动的多 Agent 编排
 - 意图驱动 RAG 检索
 - Redis + ChromaDB 分层记忆
@@ -84,8 +85,39 @@ docker compose logs -f echomind
 流程是：
 
 ```text
-读取记忆 -> 意图识别 -> 知识检索 -> Agent 路由 -> 回复生成 -> 写回记忆
+轻量上下文 -> 意图识别 -> Context Planner -> 按需检索 -> ContextBundle
+  -> Agent 路由 -> 回复生成 / 运行时补查 -> 写回记忆
 ```
+
+最近 5 条消息和最多 800 字摘要参与意图识别，再规划是否读取情景记忆、画像、知识和 Skill。
+同轮预检索和 Agent 补查共享缓存；多个 Agent 并发查询相同来源、query 和参数时只执行一次。
+Experience 仅预留接口；画像更新与记忆压缩仍沿用原流程，后台更新不受读取规划限制。
+
+调试请求示例：
+
+```json
+{
+  "message": "退款多久到账？",
+  "user_id": "demo-user",
+  "conv_id": "demo-session",
+  "debug_context": true
+}
+```
+
+返回的 `context_debug` 展示规划来源、理由、各来源状态、数量、耗时和缓存命中次数，不返回上下文正文。
+默认不输出该字段。`knowledge_used` 表示有效知识已提供给 Agent；预检索不计入 `tools_used`。
+
+Planner 配置（可选）：
+
+```env
+ECHOMIND_PLANNER_LLM_ENABLED=true
+# 留空时复用 ANTHROPIC_MODEL
+ECHOMIND_PLANNER_MODEL=
+ECHOMIND_PLANNER_CONFIDENCE_THRESHOLD=0.7
+ECHOMIND_PLANNER_TIMEOUT_SECONDS=5
+```
+
+完整设计、演示场景和兼容边界见 [Context Planner 使用与设计](wiki/ContextPlanner.md)。
 
 ### 知识库
 
@@ -110,6 +142,8 @@ docker compose logs -f echomind
 api/main.py                  FastAPI 入口
 agents/agent_orchestrator.py 多 Agent 编排
 core/intent_recognizer.py    三路融合意图识别
+core/context_planner.py      规则与 LLM 上下文规划
+core/context_runtime.py      Bundle、请求内检索缓存和共享准备流程
 core/skill_loader.py         动态 Skills 加载
 memory/conversation_memory.py  Redis + ChromaDB 记忆
 mcp/tool_manager.py          工具层、缓存、熔断、重排
@@ -126,11 +160,12 @@ data/                       持久化数据
 ```text
 用户请求
   -> /chat
-  -> MemoryManager 读取工作记忆、情景记忆、用户画像
+  -> MemoryManager 只读取近期消息与会话摘要
   -> IntentRecognizer 输出 intent / intent_group / urgency / entities
-  -> 按意图决定是否检索知识库
+  -> Context Planner 决定记忆 / 画像 / 知识 / Skill 的预加载
+  -> Selective Retrieval + ContextBundle
   -> AgentOrchestrator 路由到 General / Technical / Billing / Escalation
-  -> Skills 注入、工具调用、回复生成
+  -> 按角色注入 Skills、知识/记忆/画像运行时补查、回复生成
   -> 写回 Redis 和 ChromaDB
   -> Monitor 采集在线指标
   -> Evaluator 做意图识别和回复质量评测

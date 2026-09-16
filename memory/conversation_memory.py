@@ -21,11 +21,11 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-import chromadb
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content
+from core.context_planner import LightweightContext
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,9 @@ class MemoryManager:
         base_url:     Optional[str] = None,
         model:        str = "claude-3-5-sonnet-20241022",
     ):
+        # Native embedding libraries are only needed when constructing a real backend.
+        import chromadb
+
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
@@ -224,7 +227,7 @@ class MemoryManager:
 
         query 用于从情景记忆中检索语义相关的历史片段。
         """
-        # 1. 工作记忆（当前会话最近消息）
+        # Legacy full-context wrapper. New requests use the selective public APIs.
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         query = self._safe_text(query)
@@ -250,6 +253,25 @@ class MemoryManager:
             user_profile=profile,
             summary=summary,
         )
+
+    async def get_lightweight_context(self, user_id: str, conv_id: str) -> LightweightContext:
+        user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
+        recent, summary = await asyncio.gather(
+            self._get_working_memory(user_id, conv_id, limit=5),
+            self._redis.get(self._summary_key(user_id, conv_id)),
+        )
+        return LightweightContext(
+            recent_history=[{"role": m.role.value, "content": m.content} for m in recent],
+            summary=self._safe_text(summary or "")[:800],
+        )
+
+    async def search_episodic(self, user_id: str, conv_id: str, query: str, top_k: int = 5) -> List[str]:
+        if type(top_k) is not int or not 1 <= top_k <= self.HISTORY_TOP_K:
+            raise ValueError("top_k must be between 1 and 5")
+        return await self._search_episodic(user_id, conv_id, query, top_k=top_k, strict=True)
+
+    async def get_profile(self, user_id: str) -> Dict[str, Any]:
+        return await self._get_profile(self._safe_text(user_id), strict=True)
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
@@ -302,9 +324,9 @@ class MemoryManager:
 
     # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
-    async def _get_working_memory(self, user_id: str, conv_id: str) -> List[Message]:
+    async def _get_working_memory(self, user_id: str, conv_id: str, limit: Optional[int] = None) -> List[Message]:
         key  = self._wm_key(user_id, conv_id)
-        raws = await self._redis.lrange(key, 0, self.WORKING_MAX - 1)
+        raws = await self._redis.lrange(key, 0, (limit or self.WORKING_MAX) - 1)
         msgs = []
         for raw in reversed(raws):  # Redis lpush 最新在前，reversed 还原时序
             d = json.loads(raw)
@@ -316,27 +338,31 @@ class MemoryManager:
             ))
         return msgs
 
-    async def _search_episodic(self, user_id: str, conv_id: str, query: str) -> List[str]:
+    async def _search_episodic(self, user_id: str, conv_id: str, query: str,
+                             top_k: Optional[int] = None, strict: bool = False) -> List[str]:
         """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
         query_text = self._safe_text(query).strip()
         if not query_text:
             return []
+        count = top_k or self.HISTORY_TOP_K
         try:
             results = await self._query_episodic(
                 query_text,
-                n_results=self.HISTORY_TOP_K,
-                where={"user_id": self._safe_text(user_id), "conv_id": self._safe_text(conv_id)},
+                n_results=count,
+                where={"$and": [{"user_id": self._safe_text(user_id)}, {"conv_id": self._safe_text(conv_id)}]},
             )
             docs = self._extract_docs(results)
-            if len(docs) < self.HISTORY_TOP_K:
+            if len(docs) < count:
                 fallback = await self._query_episodic(
                     query_text,
-                    n_results=self.HISTORY_TOP_K,
+                    n_results=count,
                     where={"user_id": self._safe_text(user_id)},
                 )
                 docs.extend(self._extract_docs(fallback))
-            return self._dedupe_texts(docs)[: self.HISTORY_TOP_K]
+            return self._dedupe_texts(docs)[:count]
         except Exception as ex:
+            if strict:
+                raise
             logger.warning(f"情景记忆检索失败: {ex}")
             return []
 
@@ -359,7 +385,7 @@ class MemoryManager:
         except Exception as ex:
             logger.warning(f"存储情景记忆失败: {ex}")
 
-    async def _get_profile(self, user_id: str) -> Dict[str, Any]:
+    async def _get_profile(self, user_id: str, strict: bool = False) -> Dict[str, Any]:
         """获取用户画像（取最新一条）。"""
         try:
             doc_id = self._profile_doc_id(user_id)
@@ -370,7 +396,8 @@ class MemoryManager:
             results = await asyncio.to_thread(self._profile.get, where={"user_id": user_id})
             return self._latest_profile_from_results(results)
         except Exception:
-            pass
+            if strict:
+                raise
         return {}
 
     async def close(self) -> None:

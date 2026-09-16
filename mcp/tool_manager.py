@@ -335,20 +335,28 @@ class MCPToolManager:
 
         # 3. 合并去重（按内容哈希去重）
         seen, merged = set(), []
+        degraded = False
         for r in results:
+            if not isinstance(r, ToolResult) or not r.success or r.error:
+                degraded = True
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
+                    if isinstance(item, dict) and item.get("fallback"):
+                        degraded = True
+                        continue
                     key = hashlib.md5(str(item).encode()).hexdigest()
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)
 
         if not merged:
-            return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
+            return ToolResult(success=not degraded, data=[], tool_name=tool_name,
+                              error="检索来源失败或降级" if degraded else None)
 
         # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
         reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True,
+                          error="部分检索来源失败或降级" if degraded else None)
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
