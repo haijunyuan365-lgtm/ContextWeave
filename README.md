@@ -8,6 +8,7 @@ EchoMind 是一个面向客服/运营场景的多 Agent 智能系统。它不是
 - 意图驱动 RAG 检索
 - Redis + ChromaDB 分层记忆
 - Memory Evolution：带来源、版本和冲突处理的结构化长期记忆
+- Experience Memory：执行案例后台评分、同用户跨会话检索与负反馈撤销
 - 动态 Skills 注入
 - 在线监控与路由降权
 - LLM-as-Judge 端到端评测
@@ -92,7 +93,7 @@ docker compose logs -f echomind
 
 最近 5 条消息和最多 800 字摘要参与意图识别，再规划是否读取情景记忆、画像、知识和 Skill。
 同轮预检索和 Agent 补查共享缓存；多个 Agent 并发查询相同来源、query 和参数时只执行一次。
-Experience 仅预留接口；画像通过 Memory Evolution 在后台演化，读取规划不限制后台维护。
+Experience 按需检索历史成功处理案例，只作为 Agent 参考，不控制路由；画像通过 Memory Evolution 在后台演化。
 
 调试请求示例：
 
@@ -135,6 +136,19 @@ ECHOMIND_PLANNER_TIMEOUT_SECONDS=5
 - `GET /memory/{user_id}/status`：待处理数量、运行状态、最近成功时间和错误类别。
 
 配置、演示和单进程并发边界见 [Memory Evolution 使用与设计](docs/MemoryEvolution.md)。
+
+### Experience Memory
+
+执行后保存脱敏、限长的案例快照，后台 Judge 达标并完成向量写入后，后续会话即可检索。
+默认平均分和准确性均需达到 0.8；相似度至少 0.7，最多取 3 条，经验提示词最多 3,000 字符。
+失败、降级、部分成功、澄清和转人工案例不可复用；默认 `anonymous` 不采集、不检索。
+
+- `GET /experience/{user_id}/cases?status=active&limit=20`：查看案例摘要、评分和状态。
+- `POST /experience/{user_id}/cases/{case_id}/feedback`：提交 `{"feedback":"negative"}` 撤销案例，或 `positive` 记录正反馈。
+- `ECHOMIND_EXPERIENCE_ENABLED=false`：关闭经验功能，保留原有聊天链路。
+
+HTTP 与 CLI 共用采集、检索和后台处理模块。第一版限单应用进程，按调用方传入的 `user_id` 隔离，尚未增加身份认证。
+配置、状态机、恢复机制及演示步骤见 [Experience Memory 使用与设计](docs/ExperienceMemory.md)。
 
 ### 知识库
 

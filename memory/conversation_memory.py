@@ -130,12 +130,30 @@ class MemoryManager:
             )
 
         # 情景记忆：存储历史对话片段
+        self._chroma = chroma
         self._episodic = chroma.get_or_create_collection("episodic")
         # 用户画像：存储提炼出的偏好和实体
         self._profile  = chroma.get_or_create_collection("user_profile")
         self._memory_store = MemoryStore(chroma.get_or_create_collection("user_memory", embedding_function=None))
         self._evolution = MemoryEvolution(self._redis, self._memory_store, self._client, self._model)
         self._conversation_locks: Dict[tuple, asyncio.Lock] = {}
+
+    async def create_experience(self):
+        """Optional experience backend sharing existing Redis/Chroma connections."""
+        from experience.runtime import ExperienceManager, ExperienceStore, ExperienceIndex, enabled
+        from evaluation.evaluator import LLMJudge
+        if not enabled():
+            return None
+        try:
+            collection = await asyncio.wait_for(asyncio.to_thread(
+                self._chroma.get_or_create_collection, "experience_cases_v1", metadata={"hnsw:space": "cosine"}), 5)
+            manager = ExperienceManager(ExperienceStore(self._redis), ExperienceIndex(collection),
+                                        LLMJudge(self._client.with_options(max_retries=0), self._model))
+            await manager.start()
+            return manager
+        except Exception:
+            logger.warning("Experience backend unavailable; continuing without experience")
+            return None
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 

@@ -52,6 +52,9 @@ class ContextBundle:
             parts.append("[知识库检索结果]\n" + "\n".join(
                 f"{i}. {item.get('title', '未命名文档')}\n{str(item['content'])[:600]}"
                 for i, item in enumerate(self.knowledge[:5], 1)))
+        if self.experiences:
+            from experience.runtime import format_references
+            parts.append(format_references(self.experiences))
         return "\n\n".join(parts)
 
     def skill_prompt_for(self, agent_type: str) -> str:
@@ -61,17 +64,25 @@ class ContextBundle:
 class RetrievalSession:
     """One instance per request; completed results and in-flight work never cross requests."""
     def __init__(self, user_id: str, conv_id: str, bundle: ContextBundle,
-                 memory: Any = None, knowledge: Any = None):
+                 memory: Any = None, knowledge: Any = None, experience: Any = None):
         self.user_id, self.conv_id = user_id, conv_id
         self.bundle, self.memory, self.knowledge = bundle, memory, knowledge
+        self.experience = experience
+        if experience is not None:
+            self.bundle.sources["experience"]["status"] = "skipped"
+        self.knowledge_evidence: list = []
+        self.evidence_failed = False
         self._cache: dict[tuple, RetrievalResult] = {}
         self._pending: dict[tuple, asyncio.Task] = {}
         self.knowledge_used = False
 
     async def retrieve(self, source: str, query: str = "", top_k: int = 5) -> RetrievalResult:
-        if source not in {"memory", "profile", "knowledge"}:
+        if source not in {"memory", "profile", "knowledge", "experience"}:
             raise ValueError("unsupported retrieval source")
         maximum = 5 if source == "memory" else 20
+        if source == "experience":
+            top_k = min(top_k, 3) if type(top_k) is int else top_k
+            maximum = 3
         if type(top_k) is not int or not 1 <= top_k <= maximum:
             raise ValueError(f"top_k must be between 1 and {maximum}")
         normalized = " ".join(query.split())
@@ -97,19 +108,36 @@ class RetrievalSession:
                     if task.done() and self._pending.get(key) is task:
                         del self._pending[key]
             result = copy.deepcopy(result)
+            if source == "experience" and hit and result.data and self.experience is not None:
+                try:
+                    result.data = await self.experience.revalidate(self.user_id, result.data)
+                    result.status = "success" if result.data else "empty"
+                except Exception:
+                    result = RetrievalResult("failed", error="经验状态核验失败")
             result.cached = hit
             stat.update(status=result.status, count=len(result.data) if isinstance(result.data, (list, dict)) else 0)
             if hit:
                 stat["cache_hits"] += 1
+            if source == "experience":
+                stat["case_ids"] = [item["case_id"] for item in (result.data or [])]
+            if source == "knowledge":
+                if result.status in {"failed", "degraded"}:
+                    self.evidence_failed = True
+                for item in result.data or []:
+                    if item not in self.knowledge_evidence:
+                        self.knowledge_evidence.append(copy.deepcopy(item))
             return result
         finally:
             stat["latency_ms"] = round(stat["latency_ms"] + (time.monotonic() - started) * 1000, 2)
 
     async def _fetch(self, source: str, query: str, top_k: int) -> RetrievalResult:
-        provider = self.knowledge if source == "knowledge" else self.memory
+        provider = self.experience if source == "experience" else self.knowledge if source == "knowledge" else self.memory
         if provider is None:
             return RetrievalResult("unconfigured", error="来源未配置")
         try:
+            if source == "experience":
+                data = await provider.search(self.user_id, query, top_k)
+                return RetrievalResult("success" if data else "empty", data)
             if source == "knowledge":
                 result = await provider.search_with_rewrite("knowledge_search", query, top_k=top_k)
                 if not result.success or not isinstance(result.data, list):
@@ -151,9 +179,10 @@ class RetrievalSession:
 
 class ContextPipeline:
     def __init__(self, orchestrator: Any, planner: Any, memory: Any = None,
-                 knowledge: Any = None, skills: Any = None):
+                 knowledge: Any = None, skills: Any = None, experience: Any = None):
         self.orchestrator, self.planner = orchestrator, planner
         self.memory, self.knowledge, self.skills = memory, knowledge, skills
+        self.experience = experience
 
     async def prepare(self, req: Any) -> Any:
         light_started = time.monotonic()
@@ -178,19 +207,19 @@ class ContextPipeline:
                 "count": len(data) if source == "recent_history" else int(bool(data)),
                 "latency_ms": light_ms, "calls": int(self.memory is not None), "cache_hits": 0,
             }
-        session = RetrievalSession(req.user_id, req.conv_id, bundle, self.memory, self.knowledge)
+        session = RetrievalSession(req.user_id, req.conv_id, bundle, self.memory, self.knowledge, self.experience)
         req.context_bundle, req.retrieval_session = bundle, session
         plan = req.context_plan
 
         async def preload(source: str, query: str) -> None:
             result = await session.retrieve(source, query)
             if result.status in {"success", "empty", "degraded"}:
-                attr = {"memory": "memories", "profile": "profile", "knowledge": "knowledge"}[source]
+                attr = {"memory": "memories", "profile": "profile", "knowledge": "knowledge", "experience": "experiences"}[source]
                 setattr(bundle, attr, result.data)
 
         try:
             await asyncio.gather(*(preload(s, getattr(plan, s + "_query", None) or req.message)
-                                   for s in ("memory", "profile", "knowledge") if getattr(plan, "need_" + s)))
+                                   for s in ("memory", "profile", "knowledge", "experience") if getattr(plan, "need_" + s)))
             if plan.need_skill:
                 started = time.monotonic()
                 stat = bundle.sources["skill"]
@@ -214,8 +243,17 @@ class ContextPipeline:
             raise
 
     async def close(self) -> None:
+        if self.experience is not None:
+            await self.experience.close()
         if self.planner.client is not None:
             await self.planner.client.close()
+
+    async def capture(self, req: Any, result: Any) -> None:
+        if self.experience is not None:
+            try:
+                await self.experience.submit(req, result)
+            except Exception:
+                logger.warning("experience_capture_failed request_id=%s", req.request_id)
 
 
 def context_debug(req: Any) -> dict[str, Any]:

@@ -194,10 +194,11 @@ def test_cli_reserves_source_before_prepare_and_uses_same_source_for_both_messag
     async def prepare(req):
         calls.append("prepare")
         req.retrieval_session = SimpleNamespace(close=AsyncMock())
-    mem = SimpleNamespace(begin_turn=begin, start=AsyncMock(), close=AsyncMock(), add_message=AsyncMock())
+    mem = SimpleNamespace(begin_turn=begin, start=AsyncMock(), close=AsyncMock(), add_message=AsyncMock(),
+                          create_experience=AsyncMock(return_value=None))
     orch = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(
         response="回复", agent_type=agent_orchestrator.AgentType.GENERAL)))
-    pipeline = SimpleNamespace(prepare=prepare, close=AsyncMock())
+    pipeline = SimpleNamespace(prepare=prepare, close=AsyncMock(), capture=AsyncMock())
     answers = iter([src.content, "quit"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
     monkeypatch.setattr(main, "_anthropic_cfg", lambda: {"api_key": "test", "model": "test"})
@@ -211,4 +212,5 @@ def test_cli_reserves_source_before_prepare_and_uses_same_source_for_both_messag
     assert mem.add_message.await_count == 2
     assert all(call.kwargs["source"] is src for call in mem.add_message.call_args_list)
     mem.start.assert_awaited_once()
+    pipeline.capture.assert_awaited_once()
     mem.close.assert_awaited_once()

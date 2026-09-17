@@ -229,6 +229,14 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
 
 
 def build_context_tools() -> Dict[str, AgentToolSpec]:
+    async def search_experience(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        if req.retrieval_session is None:
+            return {"success": False, "error": "当前请求未配置经验检索", "results": []}
+        result = await req.retrieval_session.retrieve("experience", args.get("query") or req.message, args.get("top_k", 3))
+        from experience.runtime import format_references
+        return {"success": result.status in {"success", "empty"}, "reference": format_references(result.data or []),
+                "cached": result.cached, "error": result.error}
+
     async def search_memory(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         if req.retrieval_session is None:
             return {"success": False, "error": "当前请求未配置记忆检索", "results": []}
@@ -245,6 +253,9 @@ def build_context_tools() -> Dict[str, AgentToolSpec]:
                 "cached": result.cached, "error": result.error}
 
     return {
+        "search_experience": make_tool(
+            "search_experience", "检索当前用户历史处理经验，只供参考；历史业务状态必须重新查询。",
+            {"query": {"type": "string"}, "top_k": {"type": "integer"}}, search_experience, ["query"]),
         "search_conversation_memory": make_tool(
             "search_conversation_memory", "只读检索当前用户历史；结果不代表实时业务状态。",
             {"query": {"type": "string"}, "top_k": {"type": "integer"}}, search_memory, ["query"]),

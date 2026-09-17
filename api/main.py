@@ -11,7 +11,7 @@ import pathlib
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 
 _ROOT = str(pathlib.Path(__file__).parent.parent.resolve())
@@ -52,12 +52,13 @@ _skill_manager = None
 _context_pipeline = None
 
 
-def _make_context_pipeline(orchestrator, memory, knowledge, skills, cfg):
+def _make_context_pipeline(orchestrator, memory, knowledge, skills, cfg, experience=None):
     from anthropic import AsyncAnthropic
     from core.context_planner import ContextPlanner
     from core.context_runtime import ContextPipeline
     client = AsyncAnthropic(**{k: v for k, v in cfg.items() if k != "model"})
-    return ContextPipeline(orchestrator, ContextPlanner(client, cfg["model"]), memory, knowledge, skills)
+    return ContextPipeline(orchestrator, ContextPlanner(client, cfg["model"], experience_enabled=experience is not None),
+                           memory, knowledge, skills, experience)
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -166,7 +167,8 @@ async def lifespan(app: FastAPI):
     ))
     if _orchestrator is not None:
         _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
-    _context_pipeline = _make_context_pipeline(_orchestrator, _memory, _tool_manager, _skill_manager, cfg)
+    experience = await _memory.create_experience()
+    _context_pipeline = _make_context_pipeline(_orchestrator, _memory, _tool_manager, _skill_manager, cfg, experience)
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -195,10 +197,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await _monitor.stop()
-        if _memory is not None:
-            await _memory.close()
         if _context_pipeline is not None:
             await _context_pipeline.close()
+        if _memory is not None:
+            await _memory.close()
         logger.info("EchoMind 已关闭")
 
 
@@ -305,6 +307,7 @@ async def chat(req: ChatRequest):
     intent_result = await _context_pipeline.prepare(orch_req)
     try:
         result = await _orchestrator.run(orch_req)
+        await _context_pipeline.capture(orch_req, result)
     finally:
         log_context(orch_req)
         await orch_req.retrieval_session.close()
@@ -334,6 +337,39 @@ async def chat(req: ChatRequest):
         intent_source_scores=intent_result.source_scores,
         **({"context_debug": context_debug(orch_req)} if req.debug_context else {}),
     )
+
+
+class ExperienceFeedback(BaseModel):
+    feedback: Literal["positive", "negative"]
+
+
+def _experience_manager():
+    manager = getattr(_context_pipeline, "experience", None)
+    if manager is None or not manager.enabled:
+        raise HTTPException(503, "Experience 未启用或不可用")
+    return manager
+
+
+@app.get("/experience/{user_id}/cases", tags=["Experience"])
+async def experience_cases(user_id: str, status: Optional[Literal["pending", "active", "rejected", "failed", "revoked"]] = None,
+                           limit: int = Query(20, ge=1, le=100)):
+    manager = _experience_manager()
+    try:
+        return {"items": await manager.list_cases(user_id, status, limit)}
+    except Exception:
+        raise HTTPException(503, "经验存储暂时不可用") from None
+
+
+@app.post("/experience/{user_id}/cases/{case_id}/feedback", tags=["Experience"])
+async def experience_feedback(user_id: str, case_id: str, body: ExperienceFeedback):
+    manager = _experience_manager()
+    try:
+        result = await asyncio.wait_for(manager.feedback(user_id, case_id, body.feedback), manager.io_timeout)
+    except Exception:
+        raise HTTPException(503, "经验存储暂时不可用") from None
+    if result is None:
+        raise HTTPException(404, "案例不存在")
+    return result
 
 
 @app.get("/memory/{user_id}/events", tags=["Memory"])
@@ -600,7 +636,8 @@ async def _cli():
     )
 
     user_id, conv_id = "cli_user", str(uuid.uuid4())
-    pipeline = _make_context_pipeline(orch, mem, None, skill_manager, cfg)
+    experience = await mem.create_experience()
+    pipeline = _make_context_pipeline(orch, mem, None, skill_manager, cfg, experience)
     await mem.start()
 
     try:
@@ -619,6 +656,7 @@ async def _cli():
             await pipeline.prepare(req)
             try:
                 result = await orch.run(req)
+                await pipeline.capture(req, result)
             finally:
                 from core.context_runtime import log_context
                 log_context(req)
@@ -630,8 +668,8 @@ async def _cli():
             print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
 
     finally:
-        await mem.close()
         await pipeline.close()
+        await mem.close()
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ LLM-as-Judge 是评测 Agent 质量的关键技术：
 import asyncio
 import json
 import logging
+import math
 import pathlib
 import statistics
 import time
@@ -131,6 +132,12 @@ Agent 响应: {response}
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
+            fields = ("relevance", "accuracy", "completeness", "helpfulness")
+            if not isinstance(data, dict) or any(
+                type(data.get(k)) not in (int, float) or not math.isfinite(data[k]) or not 0 <= data[k] <= 1
+                for k in fields
+            ):
+                raise ValueError("invalid judge scores")
             return QualityScores(
                 relevance=float(data.get("relevance", 0.5)),
                 accuracy=float(data.get("accuracy", 0.5)),
