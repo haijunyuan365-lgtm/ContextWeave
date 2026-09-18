@@ -202,6 +202,7 @@ class ContextPipeline:
         req.history = light.recent_history or None
         req.intent, req.intent_group = intent.intent, intent.intent_group
         req.intent_confidence, req.urgency, req.entities = intent.confidence, intent.urgency, intent.entities
+        req.intent_source_scores = dict(intent.source_scores)
         req.context_plan = await self.planner.plan(req.message, intent, light)
         bundle = ContextBundle(recent_history=light.recent_history, summary=light.summary)
         for source, data in (("recent_history", light.recent_history), ("summary", light.summary)):
@@ -259,15 +260,47 @@ class ContextPipeline:
                 logger.warning("experience_capture_failed request_id=%s", req.request_id)
 
 
-def context_debug(req: Any) -> dict[str, Any]:
+def context_debug(req: Any, result: Any = None) -> dict[str, Any]:
+    """Build a redacted Intent/ContextPlan/Routing decision snapshot."""
     plan: ContextPlan = req.context_plan
+    intent = getattr(req, "intent", None)
+    urgency = getattr(req, "urgency", None)
+    entities = getattr(req, "entities", {}) or {}
+    primary = getattr(result, "primary_agent", None) if result is not None else None
+    agent_type = getattr(result, "agent_type", None) if result is not None else None
+    supporting = getattr(result, "supporting_agents", []) if result is not None else []
+    agent_types = getattr(result, "agent_types", []) if result is not None else []
     return {
+        "request_id": req.request_id,
+        # Keep the original Context Planner fields for API compatibility.
         "planner_source": plan.planner_source,
         "plan": {"need_" + s: getattr(plan, "need_" + s) for s in SOURCES},
         "reasons": dict(plan.reasons),
         "sources": copy.deepcopy(req.context_bundle.sources),
+        "intent": {
+            "category": getattr(intent, "value", intent),
+            "group": getattr(req, "intent_group", None),
+            "urgency": getattr(urgency, "name", None),
+            "confidence": round(float(getattr(req, "intent_confidence", 0.0)), 4),
+            "source_scores": dict(getattr(req, "intent_source_scores", {}) or {}),
+            # Entity types are useful for debugging; values may contain private data.
+            "entity_counts": {
+                name: len(values) if isinstance(values, list) else int(values is not None)
+                for name, values in entities.items()
+            },
+        },
+        "routing": {
+            "primary_agent": getattr(primary or agent_type, "value", primary or agent_type),
+            "supporting_agents": [getattr(item, "value", item) for item in supporting],
+            "agent_types": [getattr(item, "value", item) for item in agent_types],
+            "reason": getattr(result, "routing_reason", "") if result is not None else "",
+            "confidence": round(float(getattr(result, "routing_confidence", 0.0)), 4)
+            if result is not None else 0.0,
+            "escalated": bool(getattr(result, "escalated", False)) if result is not None else False,
+        },
+        "execution": copy.deepcopy(getattr(req, "execution_records", [])),
     }
 
 
-def log_context(req: Any) -> None:
-    logger.info("context_summary %s", json.dumps({"request_id": req.request_id, **context_debug(req)}, ensure_ascii=False))
+def log_context(req: Any, result: Any = None) -> None:
+    logger.info("request_decision %s", json.dumps(context_debug(req, result), ensure_ascii=False))

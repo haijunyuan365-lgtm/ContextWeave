@@ -230,6 +230,15 @@ data/                       持久化数据
 
 ## 开发和调试
 
+Phase 0 回归基线：
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+核心 Demo Cases、统一决策快照和已验证边界见 [Phase 0：建立改造基线](docs/Phase0建立改造基线.md)。
+
 常用顺序：
 
 ```text

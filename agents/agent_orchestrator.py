@@ -136,6 +136,7 @@ class Request:
     intent_group: Optional[str] = None
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
+    intent_source_scores: Dict[str, float] = field(default_factory=dict)
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4()))
     context_plan: Optional[ContextPlan] = None
     context_bundle: Optional[ContextBundle] = None

@@ -1,0 +1,146 @@
+[
+  {
+    "id": "greeting",
+    "message": "你好",
+    "recognized": {
+      "intent": "greeting",
+      "intent_group": "greeting",
+      "confidence": 0.98,
+      "urgency": "LOW",
+      "entities": {},
+      "source_scores": {"pattern": 1.0, "embedding": 0.91, "llm": 0.95}
+    },
+    "expected": {
+      "primary_agent": "general",
+      "supporting_agents": [],
+      "escalated": false,
+      "plan": {
+        "need_memory": false,
+        "need_profile": false,
+        "need_knowledge": false,
+        "need_skill": true,
+        "need_experience": false
+      }
+    }
+  },
+  {
+    "id": "refund_policy",
+    "message": "退款多久到账？",
+    "recognized": {
+      "intent": "refund",
+      "intent_group": "billing",
+      "confidence": 0.95,
+      "urgency": "LOW",
+      "entities": {},
+      "source_scores": {"pattern": 1.0, "embedding": 0.88, "llm": 0.93}
+    },
+    "expected": {
+      "primary_agent": "billing",
+      "supporting_agents": [],
+      "escalated": false,
+      "plan": {
+        "need_memory": false,
+        "need_profile": false,
+        "need_knowledge": true,
+        "need_skill": true,
+        "need_experience": false
+      }
+    }
+  },
+  {
+    "id": "technical_login",
+    "message": "登录一直报 401",
+    "recognized": {
+      "intent": "technical_login",
+      "intent_group": "technical",
+      "confidence": 0.96,
+      "urgency": "LOW",
+      "entities": {"error_code": ["401"]},
+      "source_scores": {"pattern": 1.0, "embedding": 0.9, "llm": 0.96}
+    },
+    "expected": {
+      "primary_agent": "technical",
+      "supporting_agents": [],
+      "escalated": false,
+      "plan": {
+        "need_memory": false,
+        "need_profile": false,
+        "need_knowledge": true,
+        "need_skill": true,
+        "need_experience": false
+      }
+    }
+  },
+  {
+    "id": "technical_and_billing",
+    "message": "登录时报 401，同时订单被重复扣款",
+    "recognized": {
+      "intent": "technical_login",
+      "intent_group": "technical",
+      "confidence": 0.92,
+      "urgency": "HIGH",
+      "entities": {"error_code": ["401"]},
+      "source_scores": {"pattern": 1.0, "embedding": 0.86, "llm": 0.91}
+    },
+    "expected": {
+      "primary_agent": "technical",
+      "supporting_agents": ["billing"],
+      "escalated": false,
+      "plan": {
+        "need_memory": false,
+        "need_profile": false,
+        "need_knowledge": true,
+        "need_skill": true,
+        "need_experience": false
+      }
+    }
+  },
+  {
+    "id": "human_handoff",
+    "message": "转人工客服",
+    "recognized": {
+      "intent": "human_handoff",
+      "intent_group": "escalation",
+      "confidence": 0.99,
+      "urgency": "LOW",
+      "entities": {},
+      "source_scores": {"pattern": 1.0, "embedding": 0.94, "llm": 0.98}
+    },
+    "expected": {
+      "primary_agent": "escalation",
+      "supporting_agents": [],
+      "escalated": true,
+      "plan": {
+        "need_memory": false,
+        "need_profile": false,
+        "need_knowledge": false,
+        "need_skill": true,
+        "need_experience": false
+      }
+    }
+  },
+  {
+    "id": "low_confidence_clarification",
+    "message": "帮我看看这个",
+    "recognized": {
+      "intent": "other",
+      "intent_group": "other",
+      "confidence": 0.3,
+      "urgency": "LOW",
+      "entities": {},
+      "source_scores": {"pattern": 0.0, "embedding": 0.28, "llm": 0.3}
+    },
+    "expected": {
+      "primary_agent": "general",
+      "supporting_agents": [],
+      "escalated": false,
+      "plan": {
+        "need_memory": false,
+        "need_profile": false,
+        "need_knowledge": false,
+        "need_skill": true,
+        "need_experience": false
+      }
+    }
+  }
+]

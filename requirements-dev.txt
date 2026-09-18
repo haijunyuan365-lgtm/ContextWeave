@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Phase 0 regression baseline
+pytest==7.1.2

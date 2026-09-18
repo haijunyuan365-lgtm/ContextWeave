@@ -1,13 +1,21 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from agents.agent_orchestrator import Request, TechnicalAgent, AgentOrchestrator, BillingAgent
+from agents.agent_orchestrator import (
+    AgentOrchestrator,
+    AgentType,
+    BillingAgent,
+    OrchestratorResult,
+    Request,
+    TechnicalAgent,
+)
 from agents.tools import build_context_tools, build_shared_rag_tools
 from core.context_planner import ContextPlanner, LightweightContext
-from core.context_runtime import ContextBundle, RetrievalSession, ContextPipeline, context_debug
+from core.context_runtime import ContextBundle, RetrievalSession, ContextPipeline, context_debug, log_context
 from core.intent_recognizer import IntentCategory, IntentResult, UrgencyLevel
 from core.skill_loader import Skill, SkillManager
 
@@ -180,3 +188,48 @@ def test_concurrent_calls_on_same_agent_keep_local_tool_records():
         assert a.tool_traces[0]["tool_use_id"] == "401"
         assert b.tool_traces[0]["tool_use_id"] == "crash"
     asyncio.run(scenario())
+
+
+def test_decision_debug_records_all_stages_without_private_values(caplog):
+    req = Request("订单 ORD-123 登录报 401", "private-user", "c")
+    req.intent = IntentCategory.TECHNICAL_LOGIN
+    req.intent_group = "technical"
+    req.urgency = UrgencyLevel.HIGH
+    req.intent_confidence = .93
+    req.intent_source_scores = {"pattern": .9, "embedding": .7, "llm": .8}
+    req.entities = {"order_id": ["ORD-123"], "error_code": ["401"]}
+    req.context_plan = ContextPlanner(None, "test").rules(
+        req.message, make_intent(IntentCategory.TECHNICAL_LOGIN), LightweightContext()
+    )[0]
+    req.context_bundle = ContextBundle()
+    result = OrchestratorResult(
+        request_id=req.request_id,
+        response="private response",
+        agent_type=AgentType.TECHNICAL,
+        intent=req.intent,
+        primary_agent=AgentType.TECHNICAL,
+        supporting_agents=[AgentType.BILLING],
+        agent_types=[AgentType.TECHNICAL, AgentType.BILLING],
+        routing_reason="technical is primary",
+        routing_confidence=.91,
+    )
+
+    debug = context_debug(req, result)
+    serialized = str(debug)
+
+    assert debug["intent"]["category"] == "technical_login"
+    assert debug["intent"]["entity_counts"] == {"order_id": 1, "error_code": 1}
+    assert debug["routing"]["primary_agent"] == "technical"
+    assert debug["routing"]["supporting_agents"] == ["billing"]
+    assert "ORD-123" not in serialized
+    assert "private-user" not in serialized
+    assert "private response" not in serialized
+
+    with caplog.at_level(logging.INFO, logger="core.context_runtime"):
+        log_context(req, result)
+    log_text = caplog.text
+    assert "request_decision" in log_text
+    assert req.request_id in log_text
+    assert "ORD-123" not in log_text
+    assert "private-user" not in log_text
+    assert "private response" not in log_text

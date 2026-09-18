@@ -310,11 +310,12 @@ async def chat(req: ChatRequest):
     orch_req = OrcReq(message=req.message, user_id=req.user_id, conv_id=conv_id)
     source = await _memory.begin_turn(req.user_id, conv_id, req.message)
     intent_result = await _context_pipeline.prepare(orch_req)
+    result = None
     try:
         result = await _orchestrator.run(orch_req)
         await _context_pipeline.capture(orch_req, result)
     finally:
-        log_context(orch_req)
+        log_context(orch_req, result)
         await orch_req.retrieval_session.close()
 
     # 4. 写入记忆
@@ -340,7 +341,7 @@ async def chat(req: ChatRequest):
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
-        **({"context_debug": context_debug(orch_req)} if req.debug_context else {}),
+        **({"context_debug": context_debug(orch_req, result)} if req.debug_context else {}),
     )
 
 

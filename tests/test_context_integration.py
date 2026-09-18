@@ -98,6 +98,17 @@ def test_chat_default_compatibility_and_opt_in_debug(monkeypatch, mode, expected
         assert ("context_debug" in body) is debug
         if debug:
             assert body["context_debug"]["planner_source"] == "rule"
+            assert body["context_debug"]["request_id"] == body["request_id"]
+            assert body["context_debug"]["intent"] == {
+                "category": "refund",
+                "group": "billing",
+                "urgency": "LOW",
+                "confidence": .95,
+                "source_scores": {},
+                "entity_counts": {},
+            }
+            assert body["context_debug"]["routing"]["primary_agent"] == "billing"
+            assert body["context_debug"]["routing"]["supporting_agents"] == []
             assert "sensitive knowledge" not in json.dumps(body["context_debug"])
         assert {"conv_id", "request_id", "response", "intent", "intent_group", "agent_type", "agent_types",
                 "primary_agent", "supporting_agents", "tools_used", "routing_reason", "routing_confidence",
