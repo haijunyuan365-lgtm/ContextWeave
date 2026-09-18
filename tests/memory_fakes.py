@@ -99,8 +99,9 @@ class FakeCollection:
         self.writes.append((list(ids), list(documents), kwargs))
 
 
-def source(seq, text="以后退款优先支付宝", user="u", conv="c"):
-    return SourceMessage(f"{user}-{seq}", user, conv, seq, f"2026-09-16T12:00:{seq % 60:02d}+00:00", text)
+def source(seq, text="以后退款优先支付宝", user="u", conv="c", project="default"):
+    return SourceMessage(f"{user}-{seq}", user, conv, seq,
+                         f"2026-09-16T12:00:{seq % 60:02d}+00:00", text, project_id=project)
 
 
 def raw_candidate(src, key="refund_method", value="alipay", operation="set", **changes):
@@ -147,7 +148,7 @@ async def enqueue(evolution, src, schedule=True):
     evolution.enqueue_commands(pipe, src)
     await pipe.execute()
     if schedule:
-        evolution.schedule(src.user_id)
+        evolution.schedule(src.project_id, src.user_id)
 
 
 async def idle(evolution):

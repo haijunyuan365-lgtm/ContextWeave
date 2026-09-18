@@ -1,1 +1,1 @@
-"""User-scoped, retrieval-augmented execution experience."""
+"""Project-and-user-scoped, retrieval-augmented execution experience."""

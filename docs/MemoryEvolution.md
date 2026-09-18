@@ -1,5 +1,7 @@
 # Memory Evolution 使用与设计
 
+> Phase 1 后所有工作记忆、情景记忆、画像快照和演化 worker 均以 `project_id + user_id`为边界；工作记忆再加 `conversation_id`。推荐使用 `/api/projects/{project_id}/memory/{user_id}` 系列调试入口，原 `/memory/{user_id}` 仅映射到 `default` 迁移项目。
+
 ## 从覆盖画像到维护记忆
 
 ```text

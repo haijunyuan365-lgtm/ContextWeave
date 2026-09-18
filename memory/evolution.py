@@ -55,6 +55,7 @@ class SourceMessage:
     timestamp: str
     content: str
     role: str = "user"
+    project_id: str = "default"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class MemoryCandidate:
 @dataclass
 class MemoryRecord:
     memory_id: str
+    project_id: str
     user_id: str
     type: str
     key: str
@@ -102,8 +104,8 @@ class MemoryDecision:
     previous_source: dict = field(default_factory=dict)
 
 
-def empty_snapshot(user_id: str) -> dict:
-    return {"schema_version": 1, "user_id": user_id, "version": 0, "records": {},
+def empty_snapshot(user_id: str, project_id: str = "default") -> dict:
+    return {"schema_version": 2, "project_id": project_id, "user_id": user_id, "version": 0, "records": {},
             "watermarks": {}, "events": [], "processed_source_ids": [], "last_success_at": None}
 
 
@@ -153,6 +155,7 @@ def validate_candidate(raw: Any, sources: dict[str, SourceMessage], threshold: f
         # without trusting another model-generated candidate as context.
         for earlier in sources.values():
             if (earlier.sequence >= source.sequence or earlier.role != "user" or earlier.user_id != source.user_id
+                    or earlier.project_id != source.project_id
                     or not EXPLICIT.search(earlier.content) or UNSAFE.search(earlier.content)
                     or AMBIGUOUS.search(earlier.content) or NEGATIVE.search(earlier.content)):
                 continue
@@ -206,7 +209,8 @@ class MemoryResolver:
             old = result["records"].get(key)
             prior = copy.deepcopy(old["value"]) if old else None
             reason = ""
-            if c.source.user_id != snapshot["user_id"] or c.source.role != "user":
+            if (c.source.user_id != snapshot["user_id"] or c.source.project_id != snapshot["project_id"]
+                    or c.source.role != "user"):
                 reason = "invalid_source"
             elif sid in seen:
                 reason = "duplicate_source"
@@ -237,8 +241,10 @@ class MemoryResolver:
                         continue
             stamp = now()
             record = MemoryRecord(
-                memory_id=hashlib.sha256(f"{snapshot['user_id']}:{c.type}:{key}".encode()).hexdigest(),
-                user_id=snapshot["user_id"], type=c.type, key=key, value=prior if status == "inactive" else value,
+                memory_id=hashlib.sha256(
+                    f"{snapshot['project_id']}:{snapshot['user_id']}:{c.type}:{key}".encode()).hexdigest(),
+                project_id=snapshot["project_id"], user_id=snapshot["user_id"],
+                type=c.type, key=key, value=prior if status == "inactive" else value,
                 created_at=old["created_at"] if old else stamp, updated_at=stamp,
                 confidence=c.confidence, source=c.evidence(), version=old["version"] + 1 if old else 1, status=status,
                 member_sources=copy.deepcopy(old.get("member_sources", {})) if old else {},

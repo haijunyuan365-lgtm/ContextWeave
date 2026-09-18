@@ -1,0 +1,19 @@
+{
+  "projects": [
+    {
+      "id": "default",
+      "name": "EchoMind 默认项目",
+      "status": "active",
+      "access_mode": "open",
+      "config": {
+        "system_prompt": "",
+        "allowed_agents": ["general", "technical", "billing", "escalation"],
+        "allowed_skills": [],
+        "allowed_tools": [],
+        "model_config": {},
+        "handoff_policy": {}
+      }
+    }
+  ],
+  "members": []
+}

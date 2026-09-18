@@ -25,6 +25,8 @@ class RetrievalResult:
 
 @dataclass
 class ContextBundle:
+    project_id: str = "default"
+    project_config: Any = None
     recent_history: list[dict[str, str]] = field(default_factory=list)
     summary: str = ""
     memories: list[str] = field(default_factory=list)
@@ -64,8 +66,9 @@ class ContextBundle:
 class RetrievalSession:
     """One instance per request; completed results and in-flight work never cross requests."""
     def __init__(self, user_id: str, conv_id: str, bundle: ContextBundle,
-                 memory: Any = None, knowledge: Any = None, experience: Any = None):
-        self.user_id, self.conv_id = user_id, conv_id
+                 memory: Any = None, knowledge: Any = None, experience: Any = None,
+                 project_id: str = "default"):
+        self.project_id, self.user_id, self.conv_id = project_id, user_id, conv_id
         self.bundle, self.memory, self.knowledge = bundle, memory, knowledge
         self.experience = experience
         if experience is not None:
@@ -91,7 +94,7 @@ class RetrievalSession:
         normalized = " ".join(query.split())
         if source == "profile":
             normalized, top_k = "", 5
-        key = (source, self.user_id, self.conv_id, normalized, top_k)
+        key = (source, self.project_id, self.user_id, self.conv_id, normalized, top_k)
         stat = self.bundle.sources[source]
         stat["calls"] += 1
         started = time.monotonic()
@@ -113,7 +116,7 @@ class RetrievalSession:
             result = copy.deepcopy(result)
             if source == "experience" and hit and result.data and self.experience is not None:
                 try:
-                    result.data = await self.experience.revalidate(self.user_id, result.data)
+                    result.data = await self.experience.revalidate(self.project_id, self.user_id, result.data)
                     result.status = "success" if result.data else "empty"
                 except Exception:
                     result = RetrievalResult("failed", error="经验状态核验失败")
@@ -139,10 +142,12 @@ class RetrievalSession:
             return RetrievalResult("unconfigured", error="来源未配置")
         try:
             if source == "experience":
-                data = await provider.search(self.user_id, query, top_k)
+                data = await provider.search(self.project_id, self.user_id, query, top_k)
                 return RetrievalResult("success" if data else "empty", data)
             if source == "knowledge":
-                result = await provider.search_with_rewrite("knowledge_search", query, top_k=top_k)
+                result = await provider.search_with_rewrite(
+                    "knowledge_search", query, self.project_id, top_k=top_k,
+                    context={"project_id": self.project_id})
                 if not result.success or not isinstance(result.data, list):
                     return RetrievalResult("failed", error="知识检索失败")
                 data = [d for d in result.data if isinstance(d, dict) and not d.get("fallback")
@@ -154,11 +159,12 @@ class RetrievalSession:
                 return RetrievalResult("degraded" if degraded else ("success" if data else "empty"),
                                        data[:top_k], bool(getattr(result, "reranked", False)))
             if source == "memory":
-                data = await provider.search_episodic(self.user_id, self.conv_id, query, top_k=top_k)
+                data = await provider.search_episodic(
+                    self.project_id, self.user_id, self.conv_id, query, top_k=top_k)
                 if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
                     return RetrievalResult("failed", error="历史记忆格式无效")
             else:
-                data = await provider.get_profile(self.user_id)
+                data = await provider.get_profile(self.project_id, self.user_id)
                 if not isinstance(data, dict):
                     return RetrievalResult("failed", error="用户画像格式无效")
             return RetrievalResult("success" if data else "empty", data)
@@ -191,7 +197,7 @@ class ContextPipeline:
         light_started = time.monotonic()
         light_failed = False
         try:
-            light = (await self.memory.get_lightweight_context(req.user_id, req.conv_id)
+            light = (await self.memory.get_lightweight_context(req.project_id, req.user_id, req.conv_id)
                      if self.memory is not None else LightweightContext((req.history or [])[-5:]))
         except Exception:
             light = LightweightContext((req.history or [])[-5:])
@@ -204,14 +210,16 @@ class ContextPipeline:
         req.intent_confidence, req.urgency, req.entities = intent.confidence, intent.urgency, intent.entities
         req.intent_source_scores = dict(intent.source_scores)
         req.context_plan = await self.planner.plan(req.message, intent, light)
-        bundle = ContextBundle(recent_history=light.recent_history, summary=light.summary)
+        bundle = ContextBundle(project_id=req.project_id, project_config=req.project_config,
+                               recent_history=light.recent_history, summary=light.summary)
         for source, data in (("recent_history", light.recent_history), ("summary", light.summary)):
             bundle.sources[source] = {
                 "status": "failed" if light_failed else ("success" if data else "empty"),
                 "count": len(data) if source == "recent_history" else int(bool(data)),
                 "latency_ms": light_ms, "calls": int(self.memory is not None), "cache_hits": 0,
             }
-        session = RetrievalSession(req.user_id, req.conv_id, bundle, self.memory, self.knowledge, self.experience)
+        session = RetrievalSession(req.user_id, req.conv_id, bundle, self.memory, self.knowledge, self.experience,
+                                   project_id=req.project_id)
         req.context_bundle, req.retrieval_session = bundle, session
         plan = req.context_plan
 
@@ -272,6 +280,7 @@ def context_debug(req: Any, result: Any = None) -> dict[str, Any]:
     agent_types = getattr(result, "agent_types", []) if result is not None else []
     return {
         "request_id": req.request_id,
+        "project_id": req.project_id,
         # Keep the original Context Planner fields for API compatibility.
         "planner_source": plan.planner_source,
         "plan": {"need_" + s: getattr(plan, "need_" + s) for s in SOURCES},

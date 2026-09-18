@@ -196,7 +196,9 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
         result = await tool_manager.search_with_rewrite(
             "knowledge_search",
             query,
+            req.project_id,
             top_k=top_k,
+            context={"project_id": req.project_id},
         )
         if not getattr(result, "success", False):
             return {

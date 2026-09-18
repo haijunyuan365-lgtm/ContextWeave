@@ -21,21 +21,22 @@ def test_lightweight_memory_reads_only_five_messages_and_summary():
     mem._redis = SimpleNamespace(lrange=AsyncMock(return_value=records), get=AsyncMock(return_value="摘" * 1000))
     mem._episodic = Mock()
     mem._profile = Mock()
-    light = asyncio.run(mem.get_lightweight_context("u", "c"))
+    light = asyncio.run(mem.get_lightweight_context("project-a", "u", "c"))
     assert [m["content"] for m in light.recent_history] == ["4", "3", "2", "1", "0"]
     assert len(light.summary) == 800
-    mem._redis.lrange.assert_awaited_once_with("wm:u:c", 0, 4)
+    mem._redis.lrange.assert_awaited_once_with("wm:project-a:u:c", 0, 4)
     assert not mem._episodic.mock_calls and not mem._profile.mock_calls
 
 
 def test_episodic_retrieval_uses_user_scope_and_deduplicates_fallback():
     mem = object.__new__(MemoryManager)
     mem._query_episodic = AsyncMock(side_effect=[{"documents": [["same"]]}, {"documents": [["same", "other"]]}])
-    result = asyncio.run(mem.search_episodic("u", "c", "退款", top_k=3))
+    result = asyncio.run(mem.search_episodic("project-a", "u", "c", "退款", top_k=3))
     assert result == ["same", "other"]
     first, second = mem._query_episodic.call_args_list
-    assert first.kwargs["where"] == {"$and": [{"user_id": "u"}, {"conv_id": "c"}]}
-    assert second.kwargs["where"] == {"user_id": "u"}
+    assert first.kwargs["where"] == {"$and": [
+        {"project_id": "project-a"}, {"user_id": "u"}, {"conv_id": "c"}]}
+    assert second.kwargs["where"] == {"$and": [{"project_id": "project-a"}, {"user_id": "u"}]}
 
 
 def test_public_memory_errors_propagate_but_legacy_helpers_keep_fallback():
@@ -44,11 +45,11 @@ def test_public_memory_errors_propagate_but_legacy_helpers_keep_fallback():
         mem._query_episodic = AsyncMock(side_effect=RuntimeError("down"))
         mem._profile = SimpleNamespace(get=Mock(side_effect=RuntimeError("down")))
         with pytest.raises(RuntimeError):
-            await mem.search_episodic("u", "c", "退款")
+            await mem.search_episodic("project-a", "u", "c", "退款")
         with pytest.raises(RuntimeError):
-            await mem.get_profile("u")
-        assert await mem._search_episodic("u", "c", "退款") == []
-        assert await mem._get_profile("u") == {}
+            await mem.get_profile("project-a", "u")
+        assert await mem._search_episodic("project-a", "u", "c", "退款") == []
+        assert await mem._get_profile("project-a", "u") == {}
     asyncio.run(scenario())
 
 
@@ -63,7 +64,7 @@ def test_rag_pipeline_distinguishes_empty_from_failure(data, success, error, exp
         manager.rewrite_query = AsyncMock(return_value=["refund"])
         manager.call = AsyncMock(return_value=ToolResult(success, data, "knowledge_search", error=error))
         manager._rerank = AsyncMock(return_value=data)
-        result = await manager.search_with_rewrite("knowledge_search", "refund")
+        result = await manager.search_with_rewrite("knowledge_search", "refund", "project-a")
         assert result.data == []
         assert result.success == (expected == "empty")
         manager._rerank.assert_not_called()

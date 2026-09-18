@@ -77,6 +77,7 @@ class KnowledgeBase:
             name=self.COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库"},
         )
+        self._migrate_legacy_project_scope()
 
         # 如果知识库为空，导入默认文档
         if self._collection.count() == 0:
@@ -86,7 +87,7 @@ class KnowledgeBase:
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
-    def add_documents(self, documents: List[Dict[str, str]]) -> int:
+    def add_documents(self, project_id: str, documents: List[Dict[str, str]]) -> int:
         """
         批量导入文档到知识库。
 
@@ -101,10 +102,11 @@ class KnowledgeBase:
             chunks  = self._chunk_text(content, chunk_size=500)
 
             for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                doc_id = hashlib.md5(f"{project_id}_{title}_{i}_{chunk[:50]}".encode()).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                metas.append({"project_id": project_id, "title": title,
+                              "chunk_index": i, "total_chunks": len(chunks)})
 
         if ids:
             # ChromaDB 会自动生成 Embedding
@@ -114,11 +116,11 @@ class KnowledgeBase:
 
         return len(ids)
 
-    async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
+    async def add_documents_async(self, project_id: str, documents: List[Dict[str, str]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
-        return await asyncio.to_thread(self.add_documents, documents)
+        return await asyncio.to_thread(self.add_documents, project_id, documents)
 
-    def _vector_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+    def _vector_search(self, project_id: str, query: str, top_k: int) -> List[Dict[str, Any]]:
         """Return the vector-ranked branch with stable Chroma chunk IDs."""
         count = self._collection.count()
         if not count:
@@ -126,6 +128,7 @@ class KnowledgeBase:
         results = self._collection.query(
             query_texts=[query],
             n_results=min(top_k, count),
+            where={"project_id": project_id},
             include=["documents", "metadatas", "distances"],
         )
 
@@ -139,6 +142,7 @@ class KnowledgeBase:
             ):
                 items.append({
                     "chunk_id": chunk_id,
+                    "project_id": project_id,
                     "title":    meta.get("title", ""),
                     "content":  doc,
                     "score":    round(1.0 - dist, 6),
@@ -148,7 +152,7 @@ class KnowledgeBase:
                 })
         return items
 
-    def _bm25_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+    def _bm25_search(self, project_id: str, query: str, top_k: int) -> List[Dict[str, Any]]:
         """Return the lexical branch from an immutable in-memory snapshot."""
         tokens = self._tokenize(query)
         if not tokens:
@@ -161,6 +165,8 @@ class KnowledgeBase:
         ranked = sorted(enumerate(scores), key=lambda pair: (-float(pair[1]), pair[0]))
         output: List[Dict[str, Any]] = []
         for index, score in ranked:
+            if items[index].get("project_id") != project_id:
+                continue
             if not any(token in bm25.doc_freqs[index] for token in tokens):
                 continue
             item = dict(items[index])
@@ -195,13 +201,13 @@ class KnowledgeBase:
             item["retrieval_sources"] = sorted(source_sets[chunk_id])
         return sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))[:top_k]
 
-    def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    def search(self, project_id: str, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """Synchronous hybrid retrieval, retained for direct callers."""
         branches: List[tuple[str, List[Dict[str, Any]]]] = []
         errors = []
         for source, searcher in (("vector", self._vector_search), ("bm25", self._bm25_search)):
             try:
-                branches.append((source, searcher(query, top_k)))
+                branches.append((source, searcher(project_id, query, top_k)))
             except Exception as ex:
                 errors.append(f"{source}: {ex}")
                 logger.warning("knowledge_%s_search_failed", source, exc_info=True)
@@ -209,12 +215,12 @@ class KnowledgeBase:
             raise RuntimeError("; ".join(errors))
         return self._rrf_fuse(branches, top_k)
 
-    async def search_async(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    async def search_async(self, project_id: str, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """Run Chroma and BM25 concurrently, degrading to either healthy branch."""
         started = time.monotonic()
         results = await asyncio.gather(
-            asyncio.to_thread(self._vector_search, query, top_k),
-            asyncio.to_thread(self._bm25_search, query, top_k),
+            asyncio.to_thread(self._vector_search, project_id, query, top_k),
+            asyncio.to_thread(self._bm25_search, project_id, query, top_k),
             return_exceptions=True,
         )
         branches: List[tuple[str, List[Dict[str, Any]]]] = []
@@ -236,11 +242,11 @@ class KnowledgeBase:
         )
         return fused
 
-    def get_embeddings(self, chunk_ids: List[str]) -> Dict[str, List[float]]:
+    def get_embeddings(self, project_id: str, chunk_ids: List[str]) -> Dict[str, List[float]]:
         """Fetch stored vectors for MMR without exposing them in search results."""
         if not chunk_ids:
             return {}
-        results = self._collection.get(ids=chunk_ids, include=["embeddings"])
+        results = self._collection.get(ids=chunk_ids, where={"project_id": project_id}, include=["embeddings"])
         embeddings = results.get("embeddings")
         if embeddings is None:
             return {}
@@ -250,16 +256,16 @@ class KnowledgeBase:
             if embedding is not None
         }
 
-    async def get_embeddings_async(self, chunk_ids: List[str]) -> Dict[str, List[float]]:
-        return await asyncio.to_thread(self.get_embeddings, chunk_ids)
+    async def get_embeddings_async(self, project_id: str, chunk_ids: List[str]) -> Dict[str, List[float]]:
+        return await asyncio.to_thread(self.get_embeddings, project_id, chunk_ids)
 
-    @property
-    def doc_count(self) -> int:
-        return self._collection.count()
+    def project_doc_count(self, project_id: str) -> int:
+        result = self._collection.get(where={"project_id": project_id}, include=[])
+        return len(result.get("ids") or [])
 
-    async def doc_count_async(self) -> int:
-        """异步获取文档片段数量。"""
-        return await asyncio.to_thread(self._collection.count)
+    async def doc_count_async(self, project_id: str) -> int:
+        """异步获取指定项目的文档片段数。"""
+        return await asyncio.to_thread(self.project_doc_count, project_id)
 
     # ── MCP 工具 handler ─────────────────────────────────────────────────────
 
@@ -274,10 +280,15 @@ class KnowledgeBase:
         ))
         """
         query = params.get("query", "")
+        project_id = str(params.get("project_id") or "").strip()
+        if not project_id:
+            raise ValueError("project_id is required")
+        if context and context.get("project_id") not in {None, project_id}:
+            raise ValueError("project scope mismatch")
         top_k = params.get("top_k", self.rag_config.recall_k)
         if type(top_k) is not int or not 1 <= top_k <= 100:
             raise ValueError("top_k must be between 1 and 100")
-        return await self.search_async(query, top_k=top_k)
+        return await self.search_async(project_id, query, top_k=top_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
@@ -291,6 +302,18 @@ class KnowledgeBase:
         # jieba may split identifiers such as ZX-900; retain their exact normalized form too.
         tokens.extend(re.findall(r"[a-z0-9]+(?:[-_.:/][a-z0-9]+)+", normalized))
         return tokens
+
+    def _migrate_legacy_project_scope(self) -> None:
+        """Assign pre-Phase-1 unscoped knowledge to the migration-only default project."""
+        result = self._collection.get(include=["metadatas"])
+        ids, metadatas = result.get("ids") or [], result.get("metadatas") or []
+        legacy = [(chunk_id, {**(metadata or {}), "project_id": "default"})
+                  for chunk_id, metadata in zip(ids, metadatas)
+                  if not (metadata or {}).get("project_id")]
+        if legacy:
+            self._collection.update(ids=[item[0] for item in legacy],
+                                    metadatas=[item[1] for item in legacy])
+            logger.info("knowledge_project_scope_migrated chunks=%d project_id=default", len(legacy))
 
     def _rebuild_bm25_index(self) -> None:
         """Build a fresh snapshot, then atomically publish it to readers."""
@@ -309,6 +332,7 @@ class KnowledgeBase:
                 continue
             items.append({
                 "chunk_id": str(chunk_id),
+                "project_id": str(metadata.get("project_id") or "default"),
                 "title": title,
                 "content": content,
                 "chunk": metadata.get("chunk_index", 0),
@@ -418,5 +442,5 @@ class KnowledgeBase:
                 ),
             },
         ]
-        self.add_documents(default_docs)
+        self.add_documents("default", default_docs)
         logger.info(f"已导入默认知识库: {len(default_docs)} 篇文档")

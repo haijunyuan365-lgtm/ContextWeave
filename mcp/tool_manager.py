@@ -330,6 +330,7 @@ class MCPToolManager:
         self,
         tool_name: str,
         query: str,
+        project_id: str,
         top_k: Optional[int] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
@@ -354,7 +355,8 @@ class MCPToolManager:
         started = time.monotonic()
         recall_k = max(top_k, config.recall_k)
         tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
+            self.call(tool_name, {"project_id": project_id, "query": q, "top_k": recall_k},
+                      {**(context or {}), "project_id": project_id}, use_cache=True)
             for q in sub_queries
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -402,7 +404,7 @@ class MCPToolManager:
         rerank_limit = max(top_k, config.rerank_candidates)
         mmr_pool = merged[:max(rerank_limit, config.mmr_candidates)]
         started = time.monotonic()
-        diverse = await self._mmr_select(tool, mmr_pool, rerank_limit, config.mmr_lambda)
+        diverse = await self._mmr_select(tool, mmr_pool, rerank_limit, config.mmr_lambda, project_id)
         timings["mmr_ms"] = (time.monotonic() - started) * 1000
         started = time.monotonic()
         reranked = await self._rerank(query, diverse, top_k)
@@ -431,7 +433,7 @@ class MCPToolManager:
         return "legacy:" + hashlib.sha256(stable.encode()).hexdigest()
 
     async def _mmr_select(self, tool: Optional[Tool], items: List[Dict[str, Any]],
-                          limit: int, relevance_weight: float) -> List[Dict[str, Any]]:
+                          limit: int, relevance_weight: float, project_id: str = "default") -> List[Dict[str, Any]]:
         """Select a relevant but non-redundant pool using stored Chroma embeddings."""
         limit = min(limit, len(items))
         if limit <= 0:
@@ -440,7 +442,7 @@ class MCPToolManager:
         if provider is None or len(items) <= 1:
             return items[:limit]
         try:
-            vectors = provider([str(item["chunk_id"]) for item in items])
+            vectors = provider(project_id, [str(item["chunk_id"]) for item in items])
             if inspect.isawaitable(vectors):
                 vectors = await vectors
             if not isinstance(vectors, dict) or any(str(item["chunk_id"]) not in vectors for item in items):

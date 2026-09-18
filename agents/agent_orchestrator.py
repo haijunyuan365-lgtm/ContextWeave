@@ -129,6 +129,8 @@ class Request:
     message:     str
     user_id:     str
     conv_id:     str
+    project_id:  str = "default"
+    project_config: Optional[Any] = None
     context:     str = ""        # 来自 MemoryManager 的格式化上下文
     history:     Optional[List[Dict[str, str]]] = None  # 对话历史，传给意图识别
     entities:    Dict[str, List[str]] = field(default_factory=dict)

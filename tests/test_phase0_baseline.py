@@ -18,7 +18,7 @@ CASES_PATH = Path(__file__).parent / "fixtures" / "phase0_demo_cases.json"
 DEMO_CASES = json.loads(CASES_PATH.read_text(encoding="utf-8"))
 
 CHAT_RESPONSE_FIELDS = {
-    "conv_id", "request_id", "response", "intent", "intent_group", "agent_type",
+    "project_id", "conv_id", "request_id", "response", "intent", "intent_group", "agent_type",
     "agent_types", "primary_agent", "supporting_agents", "tools_used",
     "routing_reason", "routing_confidence", "escalated", "latency_ms",
     "knowledge_used", "entities", "intent_confidence", "intent_source_scores",
@@ -85,6 +85,8 @@ def test_phase0_demo_case_through_chat(monkeypatch, case):
     expected = case["expected"]
 
     assert set(body) == CHAT_RESPONSE_FIELDS
+    assert body["project_id"] == "default"
+    assert body["context_debug"]["project_id"] == "default"
     assert body["intent"] == case["recognized"]["intent"]
     assert body["intent_group"] == case["recognized"]["intent_group"]
     assert body["intent_source_scores"] == case["recognized"]["source_scores"]

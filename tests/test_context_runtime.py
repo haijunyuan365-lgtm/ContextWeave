@@ -58,8 +58,8 @@ def test_preload_order_selectivity_reactive_tools_and_cache():
         assert req.retrieval_session.knowledge_used
         await tools["search_conversation_memory"].handler(req, {"query": "上次退款"})
         await tools["get_user_profile"].handler(req, {})
-        mem.search_episodic.assert_awaited_once_with("u1", "c1", "上次退款", top_k=5)
-        mem.get_profile.assert_awaited_once_with("u1")
+        mem.search_episodic.assert_awaited_once_with("default", "u1", "c1", "上次退款", top_k=5)
+        mem.get_profile.assert_awaited_once_with("default", "u1")
         debug = context_debug(req)
         assert "旧偏好" not in str(debug) and "alipay" not in str(debug) and "退款规则" not in str(debug)
         await req.retrieval_session.close()
@@ -111,7 +111,8 @@ def test_empty_results_cached_and_requests_are_isolated():
                 assert (await session.retrieve(source)).status == "empty"
                 assert (await session.retrieve(source)).cached
         assert mem.get_profile.await_count == 3 and rag.search_with_rewrite.await_count == 3
-        assert [c.args[0] for c in mem.get_profile.call_args_list] == ["u1", "u2", "u1"]
+        assert [(c.args[0], c.args[1]) for c in mem.get_profile.call_args_list] == [
+            ("default", "u1"), ("default", "u2"), ("default", "u1")]
     asyncio.run(scenario())
 
 

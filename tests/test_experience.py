@@ -39,7 +39,9 @@ class Collection:
 
     def query(self, query_texts, n_results, where, include):
         self.queries.append((query_texts, where))
-        ids = [cid for cid, (_, meta) in self.docs.items() if meta["user_id"] == where["user_id"]][:n_results]
+        filters = {key: value for item in where["$and"] for key, value in item.items()}
+        ids = [cid for cid, (_, meta) in self.docs.items()
+               if all(meta.get(key) == value for key, value in filters.items())][:n_results]
         return {"ids": [ids], "distances": [[self.distances.get(cid, .1) for cid in ids]]}
 
 
@@ -61,22 +63,22 @@ def test_complete_lifecycle_and_cached_revocation():
     async def scenario():
         m, req = manager(), request()
         cid = await m.submit(req, result())
-        assert await m.search("u1", "OAuth 登录失败，提示 401") == []
-        await m.process("u1", cid)
-        row = await m.store.read("u1", cid)
+        assert await m.search("default", "u1", "OAuth 登录失败，提示 401") == []
+        await m.process("default", "u1", cid)
+        row = await m.store.read("default", "u1", cid)
         assert row["status"] == "active" and row["attempts"] == 1
         assert len(cid) == 36
         session = RetrievalSession("u1", "new-conversation", ContextBundle(), experience=m)
         hits = await asyncio.gather(*[session.retrieve("experience", "OAuth 登录失败，提示 401", 3) for _ in range(2)])
         assert all(h.data[0]["case_id"] == cid for h in hits)
         assert len(m.index.collection.queries) == 2
-        assert await m.search("another-user", req.message) == []
-        assert (await m.feedback("u1", cid, "negative"))["status"] == "revoked"
+        assert await m.search("default", "another-user", req.message) == []
+        assert (await m.feedback("default", "u1", cid, "negative"))["status"] == "revoked"
         assert (await session.retrieve("experience", "OAuth 登录失败，提示 401", 3)).data == []
-        assert await m.search("u1", req.message) == []
-        assert (await m.feedback("u1", cid, "positive"))["status"] == "revoked"
+        assert await m.search("default", "u1", req.message) == []
+        assert (await m.feedback("default", "u1", cid, "positive"))["status"] == "revoked"
         print(json.dumps({"case_id": cid, "first_case": "active", "new_session_hits": len(hits[0].data),
-                          "after_negative_feedback_hits": len(await m.search("u1", req.message))}))
+                          "after_negative_feedback_hits": len(await m.search("default", "u1", req.message))}))
         await session.close()
     asyncio.run(scenario())
 
@@ -96,8 +98,8 @@ def test_quality_gate(scores, status):
         m.judge.judge.return_value = scores
         cid = await m.submit(request(), result())
         for _ in range(4):
-            await m.process("u1", cid)
-        case = await m.store.read("u1", cid)
+            await m.process("default", "u1", cid)
+        case = await m.store.read("default", "u1", cid)
         assert case["status"] == status
         assert case["attempts"] == (3 if status == "failed" else 1)
         assert bool(m.index.collection.docs) == (status == "active")
@@ -119,8 +121,8 @@ def test_unsuccessful_cases_never_judged(change):
         if change == "degraded": req.experience_tools = [{"success": True, "degraded": True}]
         if change == "knowledge": req.retrieval_session = SimpleNamespace(evidence_failed=True)
         cid = await m.submit(req, res)
-        await m.process("u1", cid)
-        assert (await m.store.read("u1", cid))["status"] == "rejected"
+        await m.process("default", "u1", cid)
+        assert (await m.store.read("default", "u1", cid))["status"] == "rejected"
         m.judge.judge.assert_not_awaited()
     asyncio.run(scenario())
 
@@ -130,20 +132,20 @@ def test_timeout_retry_idempotency_and_restart():
         m, req = manager(), request()
         cid = await m.submit(req, result())
         assert await m.submit(req, result()) == cid
-        assert len(await m.list_cases("u1")) == 1
+        assert len(await m.list_cases("default", "u1")) == 1
         m.judge.judge.side_effect = asyncio.TimeoutError
-        await m.process("u1", cid)
-        assert (await m.store.read("u1", cid))["status"] == "pending"
+        await m.process("default", "u1", cid)
+        assert (await m.store.read("default", "u1", cid))["status"] == "pending"
         restarted = ExperienceManager(m.store, m.index, SimpleNamespace(judge=AsyncMock(return_value=QualityScores(.9, .9, .9, .9))))
         await restarted.start()
         async def active():
-            while (await m.store.read("u1", cid))["status"] != "active":
+            while (await m.store.read("default", "u1", cid))["status"] != "active":
                 await asyncio.sleep(.01)
         try:
             await asyncio.wait_for(active(), 2)
         finally:
             await asyncio.wait_for(restarted.close(), 1)
-        assert (await m.store.read("u1", cid))["attempts"] == 2
+        assert (await m.store.read("default", "u1", cid))["attempts"] == 2
     asyncio.run(scenario())
 
 
@@ -153,15 +155,15 @@ def test_index_failure_cannot_activate_and_feedback_wins_race():
         cid = await m.submit(request(), result())
         original = m.index.upsert
         m.index.upsert = AsyncMock(side_effect=ConnectionError)
-        await m.process("u1", cid)
-        assert (await m.store.read("u1", cid))["status"] == "pending"
+        await m.process("default", "u1", cid)
+        assert (await m.store.read("default", "u1", cid))["status"] == "pending"
         async def revoke_during_index(case):
             await original(case)
-            await m.feedback("u1", cid, "negative")
+            await m.feedback("default", "u1", cid, "negative")
         m.index.upsert = revoke_during_index
-        await m.process("u1", cid)
-        assert (await m.store.read("u1", cid))["status"] == "revoked"
-        assert await m.search("u1", "401") == []
+        await m.process("default", "u1", cid)
+        assert (await m.store.read("default", "u1", cid))["status"] == "revoked"
+        assert await m.search("default", "u1", "401") == []
     asyncio.run(scenario())
 
 
@@ -169,16 +171,16 @@ def test_anonymous_disabled_low_similarity_and_redaction(monkeypatch):
     async def scenario():
         m = manager()
         assert await m.submit(request("anonymous"), result()) is None
-        assert await m.search("anonymous", "401") == []
+        assert await m.search("default", "anonymous", "401") == []
         req = request()
         req.entities = {"api_key": ["very-secret"]}
         req.message += " password=hello Bearer abc.def sk-keyvalue"
         cid = await m.submit(req, result())
-        await m.process("u1", cid)
-        raw = json.dumps(await m.store.read("u1", cid))
+        await m.process("default", "u1", cid)
+        raw = json.dumps(await m.store.read("default", "u1", cid))
         assert all(secret not in raw for secret in ["very-secret", "hello", "abc.def", "sk-keyvalue"])
         m.index.collection.distances[cid] = .6
-        assert await m.search("u1", "401") == []
+        assert await m.search("default", "u1", "401") == []
         monkeypatch.setenv("ECHOMIND_EXPERIENCE_ENABLED", "false")
         disabled = manager()
         assert await disabled.submit(request(), result()) is None
@@ -206,7 +208,7 @@ def test_pipeline_preload_tool_cache_debug_and_knowledge_capture():
     async def scenario():
         m = manager()
         cid = await m.submit(request(), result())
-        await m.process("u1", cid)
+        await m.process("default", "u1", cid)
         intent = IntentResult(IntentCategory.TECHNICAL_LOGIN, .95, UrgencyLevel.LOW, "technical", {}, "", 0)
         orch = SimpleNamespace(recognize_intent=AsyncMock(return_value=intent))
         kb = SimpleNamespace(search_with_rewrite=AsyncMock(return_value=SimpleNamespace(
@@ -287,7 +289,7 @@ def test_http_capture_feedback_and_failure_isolation(monkeypatch):
     rows = client.get("/experience/u1/cases?status=pending").json()["items"]
     assert len(rows) == 1 and rows[0]["request_id"] == response.json()["request_id"]
     cid = rows[0]["case_id"]
-    asyncio.run(m.process("u1", cid))
+    asyncio.run(m.process("default", "u1", cid))
     assert client.get("/experience/u2/cases").json()["items"] == []
     assert client.post(f"/experience/u2/cases/{cid}/feedback", json={"feedback": "negative"}).status_code == 404
     assert client.post(f"/experience/u1/cases/{cid}/feedback", json={"feedback": "bad"}).status_code == 422
@@ -313,13 +315,13 @@ def test_shutdown_preserves_pending_and_deadline_is_bounded():
         await m.start()
         await asyncio.wait_for(started.wait(), 1)
         await asyncio.wait_for(m.close(), 1)
-        assert (await m.store.read("u1", cid))["status"] == "pending"
-        assert (await m.store.redis.hgetall(m.store.PENDING))[cid] == "u1"
+        assert (await m.store.read("default", "u1", cid))["status"] == "pending"
+        assert json.loads((await m.store.redis.hgetall(m.store.PENDING))[cid]) == ["default", "u1"]
         m.timeout = .01
-        await asyncio.wait_for(m.process("u1", cid), 1)
-        assert (await m.store.read("u1", cid))["attempts"] == 2
-        await asyncio.wait_for(m.process("u1", cid), 1)
-        assert (await m.store.read("u1", cid))["status"] == "failed"
+        await asyncio.wait_for(m.process("default", "u1", cid), 1)
+        assert (await m.store.read("default", "u1", cid))["attempts"] == 2
+        await asyncio.wait_for(m.process("default", "u1", cid), 1)
+        assert (await m.store.read("default", "u1", cid))["status"] == "failed"
         assert await m.store.redis.hgetall(m.store.PENDING) == {}
     asyncio.run(scenario())
 
@@ -330,10 +332,10 @@ def test_queue_ack_failure_does_not_repeat_judging():
         cid = await m.submit(request(), result())
         m.store.redis.fail_ack = True
         with pytest.raises(ConnectionError):
-            await m.process("u1", cid)
-        assert (await m.store.read("u1", cid))["status"] == "active"
+            await m.process("default", "u1", cid)
+        assert (await m.store.read("default", "u1", cid))["status"] == "active"
         m.store.redis.fail_ack = False
-        await m.process("u1", cid)
+        await m.process("default", "u1", cid)
         m.judge.judge.assert_awaited_once()
         assert await m.store.redis.hgetall(m.store.PENDING) == {}
     asyncio.run(scenario())

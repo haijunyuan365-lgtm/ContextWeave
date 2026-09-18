@@ -25,6 +25,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
+from projects import (ProjectAccessDenied, ProjectNotFound, ProjectService,
+                      load_project_repository)
+
 load_dotenv()
 
 logging.basicConfig(
@@ -50,6 +53,7 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _context_pipeline = None
+_project_service = ProjectService(load_project_repository())
 
 
 def _make_context_pipeline(orchestrator, memory, knowledge, skills, cfg, experience=None):
@@ -76,7 +80,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _context_pipeline
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _context_pipeline, _project_service
 
     print(BANNER, flush=True)
 
@@ -90,6 +94,7 @@ async def lifespan(app: FastAPI):
     from core.skill_loader import SkillManager
 
     cfg = _anthropic_cfg()
+    _project_service = ProjectService(load_project_repository())
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
@@ -141,7 +146,7 @@ async def lifespan(app: FastAPI):
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
         rag_config=rag_config,
     )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
+    logger.info(f"默认项目知识库已加载: {await kb.doc_count_async('default')} 个文档片段")
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
         query = params.get("query", "")
@@ -160,10 +165,11 @@ async def lifespan(app: FastAPI):
         schema={
             "type": "object",
             "properties": {
+                "project_id": {"type": "string"},
                 "query": {"type": "string"},
                 "top_k": {"type": "integer"},
             },
-            "required": ["query"],
+            "required": ["project_id", "query"],
         },
         cache_ttl=300.0,
         supports_rerank=True,
@@ -230,10 +236,12 @@ class ChatRequest(BaseModel):
     message:     str
     user_id:     str = "anonymous"
     conv_id:     Optional[str] = None
+    project_id:  str = "default"
     debug_context: bool = False
 
 
 class ChatResponse(BaseModel):
+    project_id:  str
     conv_id:     str
     request_id:  str = ""
     response:    str
@@ -292,8 +300,16 @@ async def reload_skills():
     return _skill_manager.summary()
 
 
-@app.post("/chat", response_model=ChatResponse, response_model_exclude_unset=True)
-async def chat(req: ChatRequest):
+def _authorized_project(project_id: str, user_id: str):
+    try:
+        return _project_service.authorize(project_id, user_id)
+    except ProjectNotFound as exc:
+        raise HTTPException(404, "项目不存在或已停用") from exc
+    except ProjectAccessDenied as exc:
+        raise HTTPException(403, "当前用户无权访问该项目") from exc
+
+
+async def _chat(req: ChatRequest, project_id: str) -> ChatResponse:
     """ 
     主对话接口。完整流程：
       轻量上下文 → 意图识别 → 规划与按需检索 → Agent 执行/补查 → 记忆写入
@@ -305,10 +321,12 @@ async def chat(req: ChatRequest):
     from memory.conversation_memory import MsgRole
     from core.context_runtime import context_debug, log_context
 
+    project, _member = _authorized_project(project_id, req.user_id)
     conv_id = req.conv_id or str(uuid.uuid4())
 
-    orch_req = OrcReq(message=req.message, user_id=req.user_id, conv_id=conv_id)
-    source = await _memory.begin_turn(req.user_id, conv_id, req.message)
+    orch_req = OrcReq(message=req.message, user_id=req.user_id, conv_id=conv_id,
+                      project_id=project.id, project_config=project.config)
+    source = await _memory.begin_turn(project.id, req.user_id, conv_id, req.message)
     intent_result = await _context_pipeline.prepare(orch_req)
     result = None
     try:
@@ -319,10 +337,11 @@ async def chat(req: ChatRequest):
         await orch_req.retrieval_session.close()
 
     # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message, source=source)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
+    await _memory.add_message(project.id, req.user_id, conv_id, MsgRole.USER, req.message, source=source)
+    await _memory.add_message(project.id, req.user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
 
     return ChatResponse(
+        project_id=project.id,
         conv_id=conv_id,
         request_id=result.request_id,
         response=result.response,
@@ -345,6 +364,27 @@ async def chat(req: ChatRequest):
     )
 
 
+@app.post("/chat", response_model=ChatResponse, response_model_exclude_unset=True)
+async def chat(req: ChatRequest):
+    """Backward-compatible chat entry; defaults to the migration project."""
+    return await _chat(req, req.project_id)
+
+
+@app.post("/api/projects/{project_id}/chat", response_model=ChatResponse, response_model_exclude_unset=True)
+async def project_chat(project_id: str, req: ChatRequest):
+    """Project-scoped chat entry. The URL is authoritative for project scope."""
+    if "project_id" in req.model_fields_set and req.project_id != project_id:
+        raise HTTPException(409, "URL 与请求体的 project_id 不一致")
+    return await _chat(req, project_id)
+
+
+@app.get("/api/projects/{project_id}", tags=["Projects"])
+async def get_project(project_id: str, user_id: str = Query(..., min_length=1)):
+    """Read the authorized project and its effective Phase 1 configuration."""
+    project, member = _authorized_project(project_id, user_id)
+    return {"project": project.public_dict(), "role": member.role if member else None}
+
+
 class ExperienceFeedback(BaseModel):
     feedback: Literal["positive", "negative"]
 
@@ -356,21 +396,36 @@ def _experience_manager():
     return manager
 
 
-@app.get("/experience/{user_id}/cases", tags=["Experience"])
-async def experience_cases(user_id: str, status: Optional[Literal["pending", "active", "rejected", "failed", "revoked"]] = None,
-                           limit: int = Query(20, ge=1, le=100)):
+async def _experience_cases(project_id: str, user_id: str,
+                            status: Optional[Literal["pending", "active", "rejected", "failed", "revoked"]],
+                            limit: int):
+    _authorized_project(project_id, user_id)
     manager = _experience_manager()
     try:
-        return {"items": await manager.list_cases(user_id, status, limit)}
+        return {"project_id": project_id, "items": await manager.list_cases(project_id, user_id, status, limit)}
     except Exception:
         raise HTTPException(503, "经验存储暂时不可用") from None
 
 
-@app.post("/experience/{user_id}/cases/{case_id}/feedback", tags=["Experience"])
-async def experience_feedback(user_id: str, case_id: str, body: ExperienceFeedback):
+@app.get("/experience/{user_id}/cases", tags=["Experience"])
+async def experience_cases(user_id: str, status: Optional[Literal["pending", "active", "rejected", "failed", "revoked"]] = None,
+                           limit: int = Query(20, ge=1, le=100)):
+    return await _experience_cases("default", user_id, status, limit)
+
+
+@app.get("/api/projects/{project_id}/experience/{user_id}/cases", tags=["Experience"])
+async def project_experience_cases(project_id: str, user_id: str,
+                                   status: Optional[Literal["pending", "active", "rejected", "failed", "revoked"]] = None,
+                                   limit: int = Query(20, ge=1, le=100)):
+    return await _experience_cases(project_id, user_id, status, limit)
+
+
+async def _experience_feedback(project_id: str, user_id: str, case_id: str, body: ExperienceFeedback):
+    _authorized_project(project_id, user_id)
     manager = _experience_manager()
     try:
-        result = await asyncio.wait_for(manager.feedback(user_id, case_id, body.feedback), manager.io_timeout)
+        result = await asyncio.wait_for(
+            manager.feedback(project_id, user_id, case_id, body.feedback), manager.io_timeout)
     except Exception:
         raise HTTPException(503, "经验存储暂时不可用") from None
     if result is None:
@@ -378,25 +433,66 @@ async def experience_feedback(user_id: str, case_id: str, body: ExperienceFeedba
     return result
 
 
-@app.get("/memory/{user_id}/events", tags=["Memory"])
-async def memory_events(user_id: str, limit: int = Query(50, ge=1, le=200)):
+@app.post("/experience/{user_id}/cases/{case_id}/feedback", tags=["Experience"])
+async def experience_feedback(user_id: str, case_id: str, body: ExperienceFeedback):
+    return await _experience_feedback("default", user_id, case_id, body)
+
+
+@app.post("/api/projects/{project_id}/experience/{user_id}/cases/{case_id}/feedback", tags=["Experience"])
+async def project_experience_feedback(project_id: str, user_id: str, case_id: str, body: ExperienceFeedback):
+    return await _experience_feedback(project_id, user_id, case_id, body)
+
+
+async def _memory_events(project_id: str, user_id: str, limit: int):
     if _memory is None:
         raise HTTPException(503, "记忆服务未就绪")
-    return {"user_id": user_id, "events": await _memory.memory_events(user_id, limit)}
+    _authorized_project(project_id, user_id)
+    return {"project_id": project_id, "user_id": user_id,
+            "events": await _memory.memory_events(project_id, user_id, limit)}
+
+
+@app.get("/memory/{user_id}/events", tags=["Memory"])
+async def memory_events(user_id: str, limit: int = Query(50, ge=1, le=200)):
+    return await _memory_events("default", user_id, limit)
+
+
+@app.get("/api/projects/{project_id}/memory/{user_id}/events", tags=["Memory"])
+async def project_memory_events(project_id: str, user_id: str, limit: int = Query(50, ge=1, le=200)):
+    return await _memory_events(project_id, user_id, limit)
+
+
+async def _memory_status(project_id: str, user_id: str):
+    if _memory is None:
+        raise HTTPException(503, "记忆服务未就绪")
+    _authorized_project(project_id, user_id)
+    return await _memory.memory_status(project_id, user_id)
 
 
 @app.get("/memory/{user_id}/status", tags=["Memory"])
 async def memory_status(user_id: str):
+    return await _memory_status("default", user_id)
+
+
+@app.get("/api/projects/{project_id}/memory/{user_id}/status", tags=["Memory"])
+async def project_memory_status(project_id: str, user_id: str):
+    return await _memory_status(project_id, user_id)
+
+
+async def _inspect_memory(project_id: str, user_id: str):
     if _memory is None:
         raise HTTPException(503, "记忆服务未就绪")
-    return await _memory.memory_status(user_id)
+    _authorized_project(project_id, user_id)
+    return await _memory.inspect_memory(project_id, user_id)
 
 
 @app.get("/memory/{user_id}", tags=["Memory"])
 async def inspect_memory(user_id: str):
-    if _memory is None:
-        raise HTTPException(503, "记忆服务未就绪")
-    return await _memory.inspect_memory(user_id)
+    return await _inspect_memory("default", user_id)
+
+
+@app.get("/api/projects/{project_id}/memory/{user_id}", tags=["Memory"])
+async def inspect_project_memory(project_id: str, user_id: str):
+    return await _inspect_memory(project_id, user_id)
 
 
 @app.get("/monitor")
@@ -434,17 +530,32 @@ async def prometheus_metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post("/search")
-async def search(query: str, top_k: Optional[int] = Query(default=None, ge=1, le=20)):
+async def _search(project_id: str, user_id: str, query: str, top_k: Optional[int]):
     """
     演示检索优化链路：查询改写 → Vector/BM25 → RRF → MMR → 重排 → Top-K。
     展示 MCP 工具调用的核心亮点。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
+    _authorized_project(project_id, user_id)
     top_k = _tool_manager.rag_config.final_top_k if top_k is None else top_k
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    result = await _tool_manager.search_with_rewrite(
+        "knowledge_search", query, project_id, top_k=top_k, context={"project_id": project_id})
+    return {"project_id": project_id, "query": query, "results": result.data, "reranked": result.reranked}
+
+
+@app.post("/search")
+async def search(query: str, top_k: Optional[int] = Query(default=None, ge=1, le=20),
+                 project_id: str = "default", user_id: str = "anonymous"):
+    """Backward-compatible search entry scoped to the default project."""
+    return await _search(project_id, user_id, query, top_k)
+
+
+@app.post("/api/projects/{project_id}/search")
+async def project_search(project_id: str, query: str,
+                         top_k: Optional[int] = Query(default=None, ge=1, le=20),
+                         user_id: str = Query(..., min_length=1)):
+    return await _search(project_id, user_id, query, top_k)
 
 
 class DocInput(BaseModel):
@@ -479,8 +590,7 @@ class EvalRunInput(BaseModel):
     dialog_cases: Optional[List[EvalDialogInput]] = None
 
 
-@app.post("/knowledge/add", tags=["知识库"])
-async def add_knowledge(body: BatchDocInput):
+async def _add_knowledge(project_id: str, user_id: str, body: BatchDocInput):
     """
     批量导入文档到知识库。
 
@@ -496,18 +606,30 @@ async def add_knowledge(body: BatchDocInput):
     }
     ```
     """
+    _authorized_project(project_id, user_id)
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    count = await kb.add_documents_async(project_id, [{"title": d.title, "content": d.content} for d in body.documents])
     _tool_manager.clear_cache("knowledge_search")
-    total = await kb.doc_count_async()
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
+    total = await kb.doc_count_async(project_id)
+    return {"project_id": project_id, "message": f"成功导入 {count} 个文档片段",
+            "added_chunks": count, "total_chunks": total}
 
 
-@app.post("/knowledge/upload", tags=["知识库"])
-async def upload_knowledge(file: UploadFile = File(...)):
+@app.post("/knowledge/add", tags=["知识库"])
+async def add_knowledge(body: BatchDocInput, project_id: str = "default", user_id: str = "anonymous"):
+    return await _add_knowledge(project_id, user_id, body)
+
+
+@app.post("/api/projects/{project_id}/knowledge/add", tags=["知识库"])
+async def add_project_knowledge(project_id: str, body: BatchDocInput,
+                                user_id: str = Query(..., min_length=1)):
+    return await _add_knowledge(project_id, user_id, body)
+
+
+async def _upload_knowledge(project_id: str, user_id: str, file: UploadFile):
     """
     上传文件导入知识库。
 
@@ -517,6 +639,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
 
     文件大小限制：10MB
     """
+    _authorized_project(project_id, user_id)
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
@@ -542,24 +665,47 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = await kb.add_documents_async(docs)
+    count = await kb.add_documents_async(project_id, docs)
     _tool_manager.clear_cache("knowledge_search")
-    total = await kb.doc_count_async()
+    total = await kb.doc_count_async(project_id)
     return {
+        "project_id": project_id,
         "message": f"文件 {filename} 导入成功",
         "added_chunks": count,
         "total_chunks": total,
     }
 
 
-@app.get("/knowledge/stats", tags=["知识库"])
-async def knowledge_stats():
+@app.post("/knowledge/upload", tags=["知识库"])
+async def upload_knowledge(file: UploadFile = File(...), project_id: str = "default",
+                           user_id: str = "anonymous"):
+    return await _upload_knowledge(project_id, user_id, file)
+
+
+@app.post("/api/projects/{project_id}/knowledge/upload", tags=["知识库"])
+async def upload_project_knowledge(project_id: str, file: UploadFile = File(...),
+                                   user_id: str = Query(..., min_length=1)):
+    return await _upload_knowledge(project_id, user_id, file)
+
+
+async def _knowledge_stats(project_id: str, user_id: str):
     """查看知识库统计信息（文档片段总数）。"""
+    _authorized_project(project_id, user_id)
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    return {"total_chunks": await kb.doc_count_async()}
+    return {"project_id": project_id, "total_chunks": await kb.doc_count_async(project_id)}
+
+
+@app.get("/knowledge/stats", tags=["知识库"])
+async def knowledge_stats(project_id: str = "default", user_id: str = "anonymous"):
+    return await _knowledge_stats(project_id, user_id)
+
+
+@app.get("/api/projects/{project_id}/knowledge/stats", tags=["知识库"])
+async def project_knowledge_stats(project_id: str, user_id: str = Query(..., min_length=1)):
+    return await _knowledge_stats(project_id, user_id)
 
 
 @app.post("/eval/run")
@@ -644,7 +790,8 @@ async def _cli():
         model=cfg["model"],
     )
 
-    user_id, conv_id = "cli_user", str(uuid.uuid4())
+    project_id, user_id, conv_id = "default", "cli_user", str(uuid.uuid4())
+    project, _member = _project_service.authorize(project_id, user_id)
     experience = await mem.create_experience()
     pipeline = _make_context_pipeline(orch, mem, None, skill_manager, cfg, experience)
     await mem.start()
@@ -660,8 +807,9 @@ async def _cli():
                 print("再见 ʕ•ᴥ•ʔ")
                 break
 
-            req = Request(message=msg, user_id=user_id, conv_id=conv_id)
-            source = await mem.begin_turn(user_id, conv_id, msg)
+            req = Request(message=msg, user_id=user_id, conv_id=conv_id,
+                          project_id=project.id, project_config=project.config)
+            source = await mem.begin_turn(project.id, user_id, conv_id, msg)
             await pipeline.prepare(req)
             try:
                 result = await orch.run(req)
@@ -671,8 +819,8 @@ async def _cli():
                 log_context(req)
                 await req.retrieval_session.close()
 
-            await mem.add_message(user_id, conv_id, MsgRole.USER, msg, source=source)
-            await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
+            await mem.add_message(project.id, user_id, conv_id, MsgRole.USER, msg, source=source)
+            await mem.add_message(project.id, user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
 
             print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
 

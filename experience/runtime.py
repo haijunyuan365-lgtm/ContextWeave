@@ -67,6 +67,7 @@ def sanitize(value: Any, depth: int = 0) -> Any:
 class ExperienceCase:
     case_id: str
     request_id: str
+    project_id: str
     user_id: str
     conv_id: str
     query: str
@@ -87,50 +88,55 @@ class ExperienceCase:
 
 
 class ExperienceStore:
-    """Per-user Redis hashes; atomic case + recovery registry submission."""
-    PENDING = "experience:v1:pending"
+    """Per-project/user Redis hashes; atomic case + recovery registry submission."""
+    PENDING = "experience:v2:pending"
 
     def __init__(self, redis: Any):
         self.redis = redis
         self.timeout = number("IO_TIMEOUT_SECONDS", 3, .01, 30)
 
     @staticmethod
-    def key(user_id: str) -> str:
-        return "experience:v1:cases:" + hashlib.sha256(user_id.encode()).hexdigest()
+    def key(project_id: str, user_id: str) -> str:
+        scope = json.dumps([project_id, user_id], ensure_ascii=False)
+        return "experience:v2:cases:" + hashlib.sha256(scope.encode()).hexdigest()
 
     async def insert(self, case: dict) -> None:
         pipe = self.redis.pipeline(transaction=True)
-        pipe.hsetnx(self.key(case["user_id"]), case["case_id"], json.dumps(case, ensure_ascii=False))
+        pipe.hsetnx(self.key(case["project_id"], case["user_id"]), case["case_id"],
+                    json.dumps(case, ensure_ascii=False))
         if case["status"] == "pending":
-            pipe.hsetnx(self.PENDING, case["case_id"], case["user_id"])
+            pipe.hsetnx(self.PENDING, case["case_id"],
+                        json.dumps([case["project_id"], case["user_id"]], ensure_ascii=False))
         await asyncio.wait_for(pipe.execute(), self.timeout)
 
-    async def read(self, user_id: str, case_id: str) -> dict | None:
-        raw = await asyncio.wait_for(self.redis.hget(self.key(user_id), case_id), self.timeout)
+    async def read(self, project_id: str, user_id: str, case_id: str) -> dict | None:
+        raw = await asyncio.wait_for(self.redis.hget(self.key(project_id, user_id), case_id), self.timeout)
         if not raw:
             return None
         case = json.loads(raw)
-        if case.get("user_id") != user_id or case.get("case_id") != case_id:
+        if (case.get("project_id") != project_id or case.get("user_id") != user_id
+                or case.get("case_id") != case_id):
             raise ValueError("invalid experience ownership")
         return case
 
     async def write(self, case: dict) -> None:
         case["updated_at"] = now()
-        await asyncio.wait_for(self.redis.hset(self.key(case["user_id"]),
+        await asyncio.wait_for(self.redis.hset(self.key(case["project_id"], case["user_id"]),
                                               mapping={case["case_id"]: json.dumps(case, ensure_ascii=False)}), self.timeout)
 
-    async def cases(self, user_id: str) -> list[dict]:
-        values = await asyncio.wait_for(self.redis.hgetall(self.key(user_id)), self.timeout)
+    async def cases(self, project_id: str, user_id: str) -> list[dict]:
+        values = await asyncio.wait_for(self.redis.hgetall(self.key(project_id, user_id)), self.timeout)
         return [json.loads(raw) for raw in values.values()]
 
     async def pending(self):
         iterator = self.redis.hscan_iter(self.PENDING)
         while True:
             try:
-                case_id, user_id = await asyncio.wait_for(iterator.__anext__(), self.timeout)
+                case_id, raw_scope = await asyncio.wait_for(iterator.__anext__(), self.timeout)
             except StopAsyncIteration:
                 return
-            yield user_id, case_id
+            project_id, user_id = json.loads(raw_scope)
+            yield project_id, user_id, case_id
 
     async def acknowledge(self, case_id: str) -> None:
         await asyncio.wait_for(self.redis.hdel(self.PENDING, case_id), self.timeout)
@@ -144,11 +150,13 @@ class ExperienceIndex:
         # Embed the problem, not the generated answer; avoid answer-driven matches.
         text = case["query"] + "\n" + case["intent"] + "\n" + json.dumps(case["entities"], ensure_ascii=False)
         await asyncio.to_thread(self.collection.upsert, ids=[case["case_id"]], documents=[text],
-                                metadatas=[{"user_id": case["user_id"]}])
+                                metadatas=[{"project_id": case["project_id"], "user_id": case["user_id"]}])
 
-    async def search(self, user_id: str, query: str, top_k: int) -> list[tuple[str, float]]:
+    async def search(self, project_id: str, user_id: str, query: str, top_k: int) -> list[tuple[str, float]]:
         result = await asyncio.to_thread(self.collection.query, query_texts=[query],
-                                        n_results=top_k, where={"user_id": user_id}, include=["distances"])
+                                        n_results=top_k, where={"$and": [
+                                            {"project_id": project_id}, {"user_id": user_id}]},
+                                        include=["distances"])
         ids, distances = result.get("ids") or [[]], result.get("distances") or [[]]
         return [(cid, 1 - float(distance)) for cid, distance in zip(ids[0], distances[0])]
 
@@ -238,17 +246,18 @@ class ExperienceManager:
         elif getattr(session, "evidence_failed", False):
             reason = "retrieval_failure"
         case = ExperienceCase(
-            case_id=str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([req.user_id, req.request_id]))),
-            request_id=req.request_id, user_id=req.user_id, conv_id=req.conv_id,
+            case_id=str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                   json.dumps([req.project_id, req.user_id, req.request_id]))),
+            request_id=req.request_id, project_id=req.project_id, user_id=req.user_id, conv_id=req.conv_id,
             query=sanitize(req.message), intent=intent, entities=sanitize(req.entities),
             agents=list(dict.fromkeys(e.get("agent_type") for e in execution if e.get("agent_type"))),
             tools=sanitize(tools), knowledge=sanitize(knowledge), response=sanitize(result.response),
             execution=sanitize(execution), status="rejected" if reason else "pending", reason=reason)
         return asdict(case)
 
-    async def process(self, user_id: str, case_id: str) -> None:
+    async def process(self, project_id: str, user_id: str, case_id: str) -> None:
         async with self._lock:
-            case = await self.store.read(user_id, case_id)
+            case = await self.store.read(project_id, user_id, case_id)
             if not case or case["status"] != "pending":
                 await self.store.acknowledge(case_id)
                 return
@@ -271,18 +280,18 @@ class ExperienceManager:
             if accepted:
                 await asyncio.wait_for(self.index.upsert(case), self.timeout)
             async with self._lock:
-                latest = await self.store.read(user_id, case_id)
+                latest = await self.store.read(project_id, user_id, case_id)
                 if latest and latest["status"] == "pending":
                     latest.update(judge_score=values, status="active" if accepted else "rejected",
                                   reason="judge_passed" if accepted else "low_score")
                     await self.store.write(latest)
         except Exception:
             async with self._lock:
-                latest = await self.store.read(user_id, case_id)
+                latest = await self.store.read(project_id, user_id, case_id)
                 if latest and latest["status"] == "pending":
                     latest.update(status="failed" if latest["attempts"] >= 3 else "pending", reason="processing_failed")
                     await self.store.write(latest)
-        latest = await self.store.read(user_id, case_id)
+        latest = await self.store.read(project_id, user_id, case_id)
         if latest and latest["status"] != "pending":
             await self.store.acknowledge(case_id)
 
@@ -290,10 +299,10 @@ class ExperienceManager:
         while not self._stopping:
             self._wake.clear()
             try:
-                async for user_id, case_id in self.store.pending():
+                async for project_id, user_id, case_id in self.store.pending():
                     if self._stopping:
                         break
-                    await self.process(user_id, case_id)
+                    await self.process(project_id, user_id, case_id)
             except Exception:
                 logger.warning("experience_worker_storage_unavailable")
             if self._stopping:
@@ -303,40 +312,42 @@ class ExperienceManager:
             except asyncio.TimeoutError:
                 pass
 
-    async def active_references(self, user_id: str, hits: list[tuple[str, float]]) -> list[dict]:
+    async def active_references(self, project_id: str, user_id: str,
+                                hits: list[tuple[str, float]]) -> list[dict]:
         items = []
         for case_id, score in hits:
             if not math.isfinite(score) or score < self.similarity:
                 continue
-            case = await self.store.read(user_id, case_id)
+            case = await self.store.read(project_id, user_id, case_id)
             if case and case["status"] == "active":
                 items.append(reference(case, score))
         return items[:self.top_k]
 
-    async def search(self, user_id: str, query: str, top_k: int = 3) -> list[dict]:
+    async def search(self, project_id: str, user_id: str, query: str, top_k: int = 3) -> list[dict]:
         if not self.enabled or not eligible_user(user_id):
             return []
         async def retrieve():
-            hits = await self.index.search(user_id, sanitize(query), min(top_k, self.top_k) * 4)
-            return (await self.active_references(user_id, hits))[:top_k]
+            hits = await self.index.search(project_id, user_id, sanitize(query), min(top_k, self.top_k) * 4)
+            return (await self.active_references(project_id, user_id, hits))[:top_k]
         return await asyncio.wait_for(retrieve(), self.io_timeout)
 
-    async def revalidate(self, user_id: str, items: list[dict]) -> list[dict]:
+    async def revalidate(self, project_id: str, user_id: str, items: list[dict]) -> list[dict]:
         return await asyncio.wait_for(self.active_references(
-            user_id, [(i["case_id"], i["similarity"]) for i in items]), self.io_timeout)
+            project_id, user_id, [(i["case_id"], i["similarity"]) for i in items]), self.io_timeout)
 
-    async def list_cases(self, user_id: str, status: str | None = None, limit: int = 20) -> list[dict]:
-        cases = await asyncio.wait_for(self.store.cases(user_id), self.io_timeout)
+    async def list_cases(self, project_id: str, user_id: str,
+                         status: str | None = None, limit: int = 20) -> list[dict]:
+        cases = await asyncio.wait_for(self.store.cases(project_id, user_id), self.io_timeout)
         cases = sorted((c for c in cases if status is None or c["status"] == status),
                        key=lambda c: c["created_at"], reverse=True)[:limit]
         fields = ("case_id", "request_id", "status", "reason", "judge_score", "user_feedback", "created_at", "updated_at", "attempts")
         return [{**{k: c[k] for k in fields}, "query": c["query"][:300]} for c in cases]
 
-    async def feedback(self, user_id: str, case_id: str, feedback: str) -> dict | None:
+    async def feedback(self, project_id: str, user_id: str, case_id: str, feedback: str) -> dict | None:
         if feedback not in {"positive", "negative"}:
             raise ValueError("invalid feedback")
         async with self._lock:
-            case = await self.store.read(user_id, case_id)
+            case = await self.store.read(project_id, user_id, case_id)
             if not case:
                 return None
             if case["user_feedback"] != feedback:

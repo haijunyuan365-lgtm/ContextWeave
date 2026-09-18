@@ -105,7 +105,7 @@ def test_threshold_explicit_trigger_and_no_duplicate_extraction():
         assert not model.calls
         await enqueue(evo, source(5, "普通咨询"))
         await idle(evo)
-        assert len(model.calls) == 1 and (await evo.status("u"))["pending_count"] == 0
+        assert len(model.calls) == 1 and (await evo.status("default", "u"))["pending_count"] == 0
         await enqueue(evo, source(6))
         await idle(evo)
         assert len(model.calls) == 2
@@ -120,7 +120,7 @@ def test_max_twenty_messages_per_batch():
         evo, _, _, model = engine(lambda src: None)
         for n in range(1, 26):
             await enqueue(evo, source(n, "普通咨询"), schedule=False)
-        evo.schedule("u")
+        evo.schedule("default", "u")
         await idle(evo)
         sizes = [len(json.loads(c["messages"][0]["content"].splitlines()[-1])["messages"]) for c in model.calls]
         assert sizes == [20, 5]
@@ -135,9 +135,9 @@ def test_out_of_order_arrival_and_independent_users():
         await enqueue(evo, source(1))
         await enqueue(evo, source(1, user="other"))
         await idle(evo)
-        assert (await evo.profile("u", {}))["preferences"]["refund_method"] == "wechat"
-        assert (await evo.profile("other", {}))["preferences"]["refund_method"] == "alipay"
-        assert (await evo.events("u"))[0]["reason"] == "stale_source"
+        assert (await evo.profile("default", "u", {}))["preferences"]["refund_method"] == "wechat"
+        assert (await evo.profile("default", "other", {}))["preferences"]["refund_method"] == "alipay"
+        assert (await evo.events("default", "u"))[0]["reason"] == "stale_source"
     asyncio.run(scenario())
 
 
@@ -160,19 +160,19 @@ def test_failures_preserve_pending_and_recovery_is_idempotent(failure):
             evo.extractor.timeout = .01
         await enqueue(evo, source(1))
         await idle(evo)
-        assert len(await evo.pending("u")) == 1
-        assert (await evo.status("u"))["last_error_category"]
+        assert len(await evo.pending("default", "u")) == 1
+        assert (await evo.status("default", "u"))["last_error_category"]
         assert len(collection.writes) == (1 if failure == "ack" else 0)
         collection.fail_write = redis.fail_ack = False
         model.error = model.raw_response = model.release = None
         recovered = MemoryEvolution(redis, MemoryStore(collection), model, "test")
         await recovered.start()
         await idle(recovered)
-        snapshot = await recovered.store.read("u")
+        snapshot = await recovered.store.read("default", "u")
         assert snapshot["version"] == 1 and len(snapshot["events"]) == 1
         assert snapshot["records"]["refund_method"]["value"] == "alipay"
-        assert not await recovered.pending("u")
-        assert not (await recovered.status("u"))["last_error_category"]
+        assert not await recovered.pending("default", "u")
+        assert not (await recovered.status("default", "u"))["last_error_category"]
         assert len(model.calls) == (1 if failure == "ack" else 2)
     asyncio.run(scenario())
 
@@ -184,13 +184,13 @@ def test_same_user_worker_coalesces_and_shutdown_retains_pending():
         await enqueue(evo, source(1))
         await model.entered.wait()
         for _ in range(5):
-            evo.schedule("u")
+            evo.schedule("default", "u")
         assert len(evo._tasks) == 1 and len(model.calls) == 1
         await enqueue(evo, source(2))
         evo.SHUTDOWN_TIMEOUT = .01
         await evo.close()
-        assert len(await evo.pending("u")) == 2 and not evo._tasks
-        assert (await evo.store.read("u"))["version"] == 0
+        assert len(await evo.pending("default", "u")) == 2 and not evo._tasks
+        assert (await evo.store.read("default", "u"))["version"] == 0
     asyncio.run(scenario())
 
 
@@ -203,8 +203,8 @@ def test_disabled_evolution_retains_existing_memory_and_pending(monkeypatch):
         disabled = MemoryEvolution(redis, MemoryStore(collection), model, "test")
         await enqueue(disabled, source(2))
         assert not disabled._tasks
-        assert (await disabled.profile("u", {}))["preferences"]["refund_method"] == "alipay"
-        assert len(await disabled.pending("u")) == 1
+        assert (await disabled.profile("default", "u", {}))["preferences"]["refund_method"] == "alipay"
+        assert len(await disabled.pending("default", "u")) == 1
     asyncio.run(scenario())
 
 
@@ -245,5 +245,5 @@ def test_explicit_language_preference_does_not_wait_for_five_turns():
         await enqueue(evo, source(1, "请用中文回复"))
         await idle(evo)
         assert len(model.calls) == 1
-        assert (await evo.profile("u", {}))["preferences"]["response_language"] == "zh"
+        assert (await evo.profile("default", "u", {}))["preferences"]["response_language"] == "zh"
     asyncio.run(scenario())

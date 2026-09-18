@@ -29,16 +29,17 @@ class MemoryStore:
         self.collection = collection
 
     @staticmethod
-    def doc_id(user_id: str) -> str:
-        return "memory:" + hashlib.sha256(user_id.encode()).hexdigest()
+    def doc_id(project_id: str, user_id: str) -> str:
+        return "memory:" + hashlib.sha256(json.dumps([project_id, user_id]).encode()).hexdigest()
 
-    async def read(self, user_id: str) -> dict:
-        result = await asyncio.to_thread(self.collection.get, ids=[self.doc_id(user_id)])
+    async def read(self, project_id: str, user_id: str) -> dict:
+        result = await asyncio.to_thread(self.collection.get, ids=[self.doc_id(project_id, user_id)])
         documents = result.get("documents") or []
         if not documents:
-            return empty_snapshot(user_id)
+            return empty_snapshot(user_id, project_id)
         data = json.loads(documents[0])
-        if (not isinstance(data, dict) or data.get("schema_version") != 1 or data.get("user_id") != user_id
+        if (not isinstance(data, dict) or data.get("schema_version") != 2
+                or data.get("project_id") != project_id or data.get("user_id") != user_id
                 or not isinstance(data.get("records"), dict) or not isinstance(data.get("watermarks"), dict)
                 or not isinstance(data.get("events"), list) or not isinstance(data.get("processed_source_ids"), list)
                 or type(data.get("version")) is not int):
@@ -49,9 +50,10 @@ class MemoryStore:
         # A single document contains both current values and audit/checkpoint state.
         # Lookup-only collection: no embedding model is needed for profile snapshots.
         await asyncio.to_thread(self.collection.upsert,
-                               ids=[self.doc_id(snapshot["user_id"])],
+                               ids=[self.doc_id(snapshot["project_id"], snapshot["user_id"])],
                                documents=[json.dumps(snapshot, ensure_ascii=False)], embeddings=[[0.0]],
-                               metadatas=[{"user_id": snapshot["user_id"], "version": snapshot["version"]}])
+                               metadatas=[{"project_id": snapshot["project_id"],
+                                          "user_id": snapshot["user_id"], "version": snapshot["version"]}])
 
 
 class CandidateExtractor:
@@ -117,65 +119,76 @@ class MemoryEvolution:
             number("ECHOMIND_MEMORY_TIMEOUT_SECONDS", 10, .01, 120),
             number("ECHOMIND_MEMORY_CONFIDENCE_THRESHOLD", .8, 0, 1))
         self.resolver = MemoryResolver()
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._tasks: dict[str, asyncio.Task] = {}
-        self._dirty: set[str] = set()
+        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._dirty: set[tuple[str, str]] = set()
         self._closing = False
 
     @staticmethod
-    def key(user_id: str, suffix: str) -> str:
-        return "memory_evolution:" + hashlib.sha256(user_id.encode()).hexdigest() + ":" + suffix
+    def key(project_id: str, user_id: str, suffix: str) -> str:
+        scope = json.dumps([project_id, user_id], ensure_ascii=False)
+        return "memory_evolution:" + hashlib.sha256(scope.encode()).hexdigest() + ":" + suffix
+
+    @staticmethod
+    def scope(project_id: str, user_id: str) -> str:
+        return json.dumps([project_id, user_id], ensure_ascii=False)
 
     def enqueue_commands(self, pipe: Any, source: SourceMessage) -> None:
         if source.role != "user":
             raise ValueError("only user messages can be queued")
-        pipe.hsetnx(self.key(source.user_id, "pending"), source.message_id, json.dumps(asdict(source), ensure_ascii=False))
-        pipe.sadd(self.USERS_KEY, source.user_id)
+        pipe.hsetnx(self.key(source.project_id, source.user_id, "pending"), source.message_id,
+                    json.dumps(asdict(source), ensure_ascii=False))
+        pipe.sadd(self.USERS_KEY, self.scope(source.project_id, source.user_id))
 
-    async def pending(self, user_id: str) -> list[SourceMessage]:
-        items = await self.redis.hgetall(self.key(user_id, "pending"))
+    async def pending(self, project_id: str, user_id: str) -> list[SourceMessage]:
+        items = await self.redis.hgetall(self.key(project_id, user_id, "pending"))
         messages = [SourceMessage(**json.loads(value)) for value in items.values()]
         if any(source.message_id != stored_id for source, stored_id in zip(messages, items)):
             raise ValueError("pending source identity mismatch")
-        if any(m.user_id != user_id or m.role != "user" or type(m.sequence) is not int or m.sequence < 1 for m in messages):
+        if any(m.project_id != project_id or m.user_id != user_id or m.role != "user"
+               or type(m.sequence) is not int or m.sequence < 1 for m in messages):
             raise ValueError("invalid pending source")
         return sorted(messages, key=lambda s: (s.sequence, s.message_id))
 
-    def schedule(self, user_id: str) -> None:
+    def schedule(self, project_id: str, user_id: str) -> None:
         if not self.enabled or self._closing:
             return
-        self._dirty.add(user_id)
-        if user_id not in self._tasks:
-            self._start(user_id)
+        scope = (project_id, user_id)
+        self._dirty.add(scope)
+        if scope not in self._tasks:
+            self._start(project_id, user_id)
 
-    def _start(self, user_id: str) -> None:
-        task = asyncio.create_task(self._worker(user_id))
-        self._tasks[user_id] = task
-        task.add_done_callback(lambda done: self._finished(user_id, done))
+    def _start(self, project_id: str, user_id: str) -> None:
+        scope = (project_id, user_id)
+        task = asyncio.create_task(self._worker(project_id, user_id))
+        self._tasks[scope] = task
+        task.add_done_callback(lambda done: self._finished(project_id, user_id, done))
 
-    def _finished(self, user_id: str, task: asyncio.Task) -> None:
-        if self._tasks.get(user_id) is task:
-            del self._tasks[user_id]
+    def _finished(self, project_id: str, user_id: str, task: asyncio.Task) -> None:
+        scope = (project_id, user_id)
+        if self._tasks.get(scope) is task:
+            del self._tasks[scope]
         if not task.cancelled():
             task.exception()  # Observe every managed task, including shutdown failures.
-        if user_id in self._dirty and not self._closing:
-            self._start(user_id)
+        if scope in self._dirty and not self._closing:
+            self._start(project_id, user_id)
 
-    async def _worker(self, user_id: str) -> None:
-        self._dirty.discard(user_id)
-        lock = self._locks.setdefault(user_id, asyncio.Lock())
+    async def _worker(self, project_id: str, user_id: str) -> None:
+        scope = (project_id, user_id)
+        self._dirty.discard(scope)
+        lock = self._locks.setdefault(scope, asyncio.Lock())
         async with lock:
             try:
                 while True:
-                    pending = await self.pending(user_id)
+                    pending = await self.pending(project_id, user_id)
                     if not pending:
                         return
-                    snapshot = await self.store.read(user_id)
+                    snapshot = await self.store.read(project_id, user_id)
                     processed = set(snapshot["processed_source_ids"])
                     acknowledged = [s.message_id for s in pending if s.message_id in processed]
                     if acknowledged:
-                        await self.redis.hdel(self.key(user_id, "pending"), *acknowledged)
-                        await self.redis.hset(self.key(user_id, "status"), mapping={"last_error_category": ""})
+                        await self.redis.hdel(self.key(project_id, user_id, "pending"), *acknowledged)
+                        await self.redis.hset(self.key(project_id, user_id, "status"), mapping={"last_error_category": ""})
                     pending = [s for s in pending if s.message_id not in processed]
                     if len(pending) < self.batch_turns and not any(EXPLICIT.search(s.content) for s in pending):
                         return
@@ -188,8 +201,8 @@ class MemoryEvolution:
                     updated["last_success_at"] = now()
                     await self.store.write(updated)
                     # Checkpoint precedes acknowledgement, making uncertain/failed ACKs replay-safe.
-                    await self.redis.hdel(self.key(user_id, "pending"), *(s.message_id for s in batch))
-                    await self.redis.hset(self.key(user_id, "status"), mapping={"last_error_category": ""})
+                    await self.redis.hdel(self.key(project_id, user_id, "pending"), *(s.message_id for s in batch))
+                    await self.redis.hset(self.key(project_id, user_id, "status"), mapping={"last_error_category": ""})
                     for decision in [*decisions, *rejected]:
                         logger.info("memory_evolution %s", json.dumps({
                             "action": decision.action, "key": decision.key, "reason": decision.reason,
@@ -199,33 +212,39 @@ class MemoryEvolution:
                 category = "timeout" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__
                 logger.warning("memory_evolution_failed category=%s", category)
                 try:
-                    await self.redis.hset(self.key(user_id, "status"), mapping={"last_error_category": category})
+                    await self.redis.hset(self.key(project_id, user_id, "status"), mapping={"last_error_category": category})
                 except Exception:
                     logger.warning("memory_evolution_status_unavailable")
 
     async def start(self) -> None:
         if self.enabled:
-            async for user_id in self.redis.sscan_iter(self.USERS_KEY):
-                self.schedule(user_id)
+            async for raw_scope in self.redis.sscan_iter(self.USERS_KEY):
+                try:
+                    project_id, user_id = json.loads(raw_scope)
+                except (TypeError, ValueError):
+                    project_id, user_id = "default", str(raw_scope)
+                self.schedule(project_id, user_id)
 
-    async def status(self, user_id: str) -> dict:
-        state = await self.redis.hgetall(self.key(user_id, "status"))
-        snapshot = await self.store.read(user_id)
-        return {"enabled": self.enabled, "running": user_id in self._tasks,
-                "pending_count": await self.redis.hlen(self.key(user_id, "pending")),
+    async def status(self, project_id: str, user_id: str) -> dict:
+        scope = (project_id, user_id)
+        state = await self.redis.hgetall(self.key(project_id, user_id, "status"))
+        snapshot = await self.store.read(project_id, user_id)
+        return {"project_id": project_id, "enabled": self.enabled, "running": scope in self._tasks,
+                "pending_count": await self.redis.hlen(self.key(project_id, user_id, "pending")),
                 "last_success_at": snapshot["last_success_at"],
                 "last_error_category": state.get("last_error_category") or None}
 
-    async def profile(self, user_id: str, legacy: dict) -> dict:
-        return effective_profile(await self.store.read(user_id), legacy)
+    async def profile(self, project_id: str, user_id: str, legacy: dict) -> dict:
+        return effective_profile(await self.store.read(project_id, user_id), legacy)
 
-    async def inspect(self, user_id: str, legacy: dict) -> dict:
-        snapshot = await self.store.read(user_id)
-        return {"user_id": user_id, "version": snapshot["version"], "records": list(snapshot["records"].values()),
+    async def inspect(self, project_id: str, user_id: str, legacy: dict) -> dict:
+        snapshot = await self.store.read(project_id, user_id)
+        return {"project_id": project_id, "user_id": user_id, "version": snapshot["version"],
+                "records": list(snapshot["records"].values()),
                 "profile": effective_profile(snapshot, legacy), "legacy_profile": legacy}
 
-    async def events(self, user_id: str, limit: int = 50) -> list:
-        snapshot = await self.store.read(user_id)
+    async def events(self, project_id: str, user_id: str, limit: int = 50) -> list:
+        snapshot = await self.store.read(project_id, user_id)
         return sorted(snapshot["events"], key=lambda item: item["timestamp"], reverse=True)[:limit]
 
     async def close(self) -> None:

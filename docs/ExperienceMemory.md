@@ -1,6 +1,6 @@
 # Experience Memory 使用与设计
 
-Experience Memory 复用同一用户过去成功请求的处理过程，帮助 Agent 排障和选择检查步骤。它不会修改路由、执行历史工具操作，也不证明某个订单现在已退款或某个账户现在可登录。
+Experience Memory 复用同一项目、同一用户过去成功请求的处理过程，帮助 Agent 排障和选择检查步骤。它不会修改路由、执行历史工具操作，也不证明某个订单现在已退款或某个账户现在可登录。Phase 9 才会将它改为项目内跨用户共享。
 
 ## 执行链路
 
@@ -42,8 +42,8 @@ HTTP / CLI → ContextPlanner → RetrievalSession → ContextBundle → Agent /
 
 ### 存储、恢复与故障边界
 
-- Redis `experience:v1:cases:<user hash>` 保存权威案例；`experience:v1:pending` 保存待处理案例到用户的映射。两个写入放在同一个 Redis 事务中。
-- Chroma 独立 collection `experience_cases_v1` 使用 cosine 距离；对脱敏问题、意图和实体向量化，避免由生成回答主导匹配。
+- Redis `experience:v2:cases:<project+user hash>` 保存权威案例；`experience:v2:pending` 保存待处理案例到项目/用户的映射。
+- Chroma 独立 collection `experience_cases_v2` 使用 `project_id + user_id` 过滤和 cosine 距离。
 - 默认一个后台消费者。启动和运行中扫描 pending 任务；终态成功持久化后才移除任务。进程在任意步骤停止都可在启动后恢复；重复索引写入使用 upsert。
 - 关机取消消费者，未完成任务保留在 Redis。最后一次尝试被中断后，恢复时会保守标记 failed，不额外突破三次上限。
 - 索引可能残留 revoked 或未激活条目，因此检索时按用户过滤、超额召回，再到 Redis 核验 active 状态。请求内缓存命中也重新核验；正在执行且已获得参考的模型请求不会被追溯取消。

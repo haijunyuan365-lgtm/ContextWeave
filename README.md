@@ -82,7 +82,9 @@ docker compose logs -f echomind
 
 ### 对话主链路
 
-`POST /chat`
+Project 入口（推荐）：`POST /api/projects/{project_id}/chat`
+
+兼容入口：`POST /chat`，请求体可携带 `project_id`，省略时使用开放的 `default` 迁移项目。
 
 流程是：
 
@@ -102,6 +104,7 @@ Experience 按需检索历史成功处理案例，只作为 Agent 参考，不�
   "message": "退款多久到账？",
   "user_id": "demo-user",
   "conv_id": "demo-session",
+  "project_id": "default",
   "debug_context": true
 }
 ```
@@ -131,9 +134,9 @@ ECHOMIND_PLANNER_TIMEOUT_SECONDS=5
 
 内部只读调试入口：
 
-- `GET /memory/{user_id}`：有效画像、结构化记录及旧画像。
-- `GET /memory/{user_id}/events?limit=50`：演化事件，最多 200 条。
-- `GET /memory/{user_id}/status`：待处理数量、运行状态、最近成功时间和错误类别。
+- `GET /api/projects/{project_id}/memory/{user_id}`：项目内有效画像、结构化记录及旧画像。
+- `GET /api/projects/{project_id}/memory/{user_id}/events?limit=50`：演化事件，最多 200 条。
+- `GET /api/projects/{project_id}/memory/{user_id}/status`：待处理数量、运行状态、最近成功时间和错误类别。
 
 配置、演示和单进程并发边界见 [Memory Evolution 使用与设计](docs/MemoryEvolution.md)。
 
@@ -143,19 +146,19 @@ ECHOMIND_PLANNER_TIMEOUT_SECONDS=5
 默认平均分和准确性均需达到 0.8；相似度至少 0.7，最多取 3 条，经验提示词最多 3,000 字符。
 失败、降级、部分成功、澄清和转人工案例不可复用；默认 `anonymous` 不采集、不检索。
 
-- `GET /experience/{user_id}/cases?status=active&limit=20`：查看案例摘要、评分和状态。
-- `POST /experience/{user_id}/cases/{case_id}/feedback`：提交 `{"feedback":"negative"}` 撤销案例，或 `positive` 记录正反馈。
+- `GET /api/projects/{project_id}/experience/{user_id}/cases?status=active&limit=20`：查看项目内的案例摘要、评分和状态。
+- `POST /api/projects/{project_id}/experience/{user_id}/cases/{case_id}/feedback`：提交反馈。
 - `ECHOMIND_EXPERIENCE_ENABLED=false`：关闭经验功能，保留原有聊天链路。
 
-HTTP 与 CLI 共用采集、检索和后台处理模块。第一版限单应用进程，按调用方传入的 `user_id` 隔离，尚未增加身份认证。
+HTTP 与 CLI 共用采集、检索和后台处理模块。Phase 1 按 `project_id + user_id` 隔离；改成项目共享 Experience 属于 Phase 9。当前 `user_id` 仍由调用方传入，尚未增加 JWT 身份认证。
 配置、状态机、恢复机制及演示步骤见 [Experience Memory 使用与设计](docs/ExperienceMemory.md)。
 
 ### 知识库
 
-- `POST /search`
-- `POST /knowledge/add`
-- `POST /knowledge/upload`
-- `GET /knowledge/stats`
+- `POST /api/projects/{project_id}/search`
+- `POST /api/projects/{project_id}/knowledge/add`
+- `POST /api/projects/{project_id}/knowledge/upload`
+- `GET /api/projects/{project_id}/knowledge/stats`
 
 知识检索采用多查询改写、Chroma Vector + BM25、两级 RRF、chunk ID 去重、MMR 和 LLM 重排。可选配置：
 
@@ -184,6 +187,7 @@ HTTP 与 CLI 共用采集、检索和后台处理模块。第一版限单应用�
 
 ```text
 api/main.py                  FastAPI 入口
+projects/                    Project 模型、JSON Repository 与成员权限边界
 agents/agent_orchestrator.py 多 Agent 编排
 core/intent_recognizer.py    三路融合意图识别
 core/context_planner.py      规则与 LLM 上下文规划
@@ -206,6 +210,7 @@ data/                       持久化数据
 ```text
 用户请求
   -> /chat
+  -> Project 存在性 / 状态 / 成员权限校验
   -> MemoryManager 只读取近期消息与会话摘要
   -> IntentRecognizer 输出 intent / intent_group / urgency / entities
   -> Context Planner 决定记忆 / 画像 / 知识 / Skill 的预加载

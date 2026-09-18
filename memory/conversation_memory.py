@@ -146,7 +146,7 @@ class MemoryManager:
             return None
         try:
             collection = await asyncio.wait_for(asyncio.to_thread(
-                self._chroma.get_or_create_collection, "experience_cases_v1", metadata={"hnsw:space": "cosine"}), 5)
+                self._chroma.get_or_create_collection, "experience_cases_v2", metadata={"hnsw:space": "cosine"}), 5)
             manager = ExperienceManager(ExperienceStore(self._redis), ExperienceIndex(collection),
                                         LLMJudge(self._client.with_options(max_retries=0), self._model))
             await manager.start()
@@ -157,26 +157,30 @@ class MemoryManager:
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
-    async def begin_turn(self, user_id: str, conv_id: str, content: str) -> SourceMessage:
+    async def begin_turn(self, project_id: str, user_id: str, conv_id: str, content: str) -> SourceMessage:
         """Reserve source order at receipt, before model calls can finish out of order."""
         user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
-        sequence = await self._redis.incr(MemoryEvolution.key(user_id, "sequence"))
-        return SourceMessage(str(uuid.uuid4()), user_id, conv_id, sequence, now(), self._safe_text(content))
+        project_id = self._safe_text(project_id)
+        sequence = await self._redis.incr(MemoryEvolution.key(project_id, user_id, "sequence"))
+        return SourceMessage(str(uuid.uuid4()), user_id, conv_id, sequence, now(),
+                             self._safe_text(content), project_id=project_id)
 
-    def _conversation_lock(self, user_id: str, conv_id: str) -> asyncio.Lock:
-        return self._conversation_locks.setdefault((user_id, conv_id), asyncio.Lock())
+    def _conversation_lock(self, project_id: str, user_id: str, conv_id: str) -> asyncio.Lock:
+        return self._conversation_locks.setdefault((project_id, user_id, conv_id), asyncio.Lock())
 
     async def add_message(
-        self, user_id: str, conv_id: str, role: MsgRole, content: str,
+        self, project_id: str, user_id: str, conv_id: str, role: MsgRole, content: str,
         metadata: Optional[Dict[str, Any]] = None, *, source: Optional[SourceMessage] = None,
     ) -> Message:
         """Atomically retain user evidence separately from compressible working memory."""
-        user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
+        project_id, user_id, conv_id = (self._safe_text(project_id), self._safe_text(user_id),
+                                        self._safe_text(conv_id))
         content = self._safe_text(content)
         if source is None and role == MsgRole.USER:
-            source = await self.begin_turn(user_id, conv_id, content)
+            source = await self.begin_turn(project_id, user_id, conv_id, content)
         if source is not None:
-            if source.user_id != user_id or source.conv_id != conv_id or source.role != "user":
+            if (source.project_id != project_id or source.user_id != user_id
+                    or source.conv_id != conv_id or source.role != "user"):
                 raise ValueError("source scope mismatch")
             if role == MsgRole.USER and source.content != content:
                 raise ValueError("source content mismatch")
@@ -188,8 +192,8 @@ class MemoryManager:
             msg.message_id = source.message_id if role == MsgRole.USER else source.message_id + ":" + role.value
             if role == MsgRole.USER:
                 msg.timestamp = datetime.fromisoformat(source.timestamp)
-        key = self._wm_key(user_id, conv_id)
-        async with self._conversation_lock(user_id, conv_id):
+        key = self._wm_key(project_id, user_id, conv_id)
+        async with self._conversation_lock(project_id, user_id, conv_id):
             pipe = self._redis.pipeline(transaction=True)
             pipe.lpush(key, json.dumps({
                 "role": role.value, "content": content, "ts": msg.timestamp.isoformat(),
@@ -200,56 +204,57 @@ class MemoryManager:
                 self._evolution.enqueue_commands(pipe, source)
             await pipe.execute()
             if role == MsgRole.USER:
-                self._evolution.schedule(user_id)
+                self._evolution.schedule(project_id, user_id)
             if await self._redis.llen(key) >= self.COMPRESS_AT:
-                await self._compress_locked(user_id, conv_id)
+                await self._compress_locked(project_id, user_id, conv_id)
         return msg
 
-    async def update_profile(self, user_id: str, conv_id: str) -> None:
+    async def update_profile(self, project_id: str, user_id: str, conv_id: str) -> None:
         """Compatibility entrypoint: schedule durable pending user messages, never rewrite legacy data."""
-        self._evolution.schedule(self._safe_text(user_id))
+        self._evolution.schedule(self._safe_text(project_id), self._safe_text(user_id))
 
     async def start(self) -> None:
         await self._evolution.start()
 
-    async def inspect_memory(self, user_id: str) -> Dict[str, Any]:
-        user_id = self._safe_text(user_id)
-        legacy = await self._get_legacy_profile(user_id, strict=True)
-        return await self._evolution.inspect(user_id, legacy)
+    async def inspect_memory(self, project_id: str, user_id: str) -> Dict[str, Any]:
+        project_id, user_id = self._safe_text(project_id), self._safe_text(user_id)
+        legacy = await self._get_legacy_profile(project_id, user_id, strict=True)
+        return await self._evolution.inspect(project_id, user_id, legacy)
 
-    async def memory_events(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        return await self._evolution.events(self._safe_text(user_id), limit)
+    async def memory_events(self, project_id: str, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return await self._evolution.events(self._safe_text(project_id), self._safe_text(user_id), limit)
 
-    async def memory_status(self, user_id: str) -> Dict[str, Any]:
-        return await self._evolution.status(self._safe_text(user_id))
+    async def memory_status(self, project_id: str, user_id: str) -> Dict[str, Any]:
+        return await self._evolution.status(self._safe_text(project_id), self._safe_text(user_id))
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
-    async def get_context(self, user_id: str, conv_id: str, query: str = "") -> MemoryContext:
+    async def get_context(self, project_id: str, user_id: str, conv_id: str, query: str = "") -> MemoryContext:
         """
         构建完整的记忆上下文。
 
         query 用于从情景记忆中检索语义相关的历史片段。
         """
         # Legacy full-context wrapper. New requests use the selective public APIs.
+        project_id = self._safe_text(project_id)
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         query = self._safe_text(query)
 
-        recent = await self._get_working_memory(user_id, conv_id)
+        recent = await self._get_working_memory(project_id, user_id, conv_id)
 
         # 2. 情景记忆（跨会话语义检索）
         history = await self._search_episodic(
-            user_id,
+            project_id, user_id,
             conv_id,
             query or (recent[-1].content if recent else ""),
         )
 
         # 3. 用户画像
-        profile = await self._get_profile(user_id)
+        profile = await self._get_profile(project_id, user_id)
 
         # 4. 会话摘要（如果已压缩过）
-        summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ""
+        summary = await self._redis.get(self._summary_key(project_id, user_id, conv_id)) or ""
 
         return MemoryContext(
             recent_messages=recent,
@@ -258,32 +263,33 @@ class MemoryManager:
             summary=summary,
         )
 
-    async def get_lightweight_context(self, user_id: str, conv_id: str) -> LightweightContext:
-        user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
+    async def get_lightweight_context(self, project_id: str, user_id: str, conv_id: str) -> LightweightContext:
+        project_id, user_id, conv_id = (self._safe_text(project_id), self._safe_text(user_id), self._safe_text(conv_id))
         recent, summary = await asyncio.gather(
-            self._get_working_memory(user_id, conv_id, limit=5),
-            self._redis.get(self._summary_key(user_id, conv_id)),
+            self._get_working_memory(project_id, user_id, conv_id, limit=5),
+            self._redis.get(self._summary_key(project_id, user_id, conv_id)),
         )
         return LightweightContext(
             recent_history=[{"role": m.role.value, "content": m.content} for m in recent],
             summary=self._safe_text(summary or "")[:800],
         )
 
-    async def search_episodic(self, user_id: str, conv_id: str, query: str, top_k: int = 5) -> List[str]:
+    async def search_episodic(self, project_id: str, user_id: str, conv_id: str,
+                              query: str, top_k: int = 5) -> List[str]:
         if type(top_k) is not int or not 1 <= top_k <= self.HISTORY_TOP_K:
             raise ValueError("top_k must be between 1 and 5")
-        return await self._search_episodic(user_id, conv_id, query, top_k=top_k, strict=True)
+        return await self._search_episodic(project_id, user_id, conv_id, query, top_k=top_k, strict=True)
 
-    async def get_profile(self, user_id: str) -> Dict[str, Any]:
-        return await self._get_profile(self._safe_text(user_id), strict=True)
+    async def get_profile(self, project_id: str, user_id: str) -> Dict[str, Any]:
+        return await self._get_profile(self._safe_text(project_id), self._safe_text(user_id), strict=True)
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
-    async def _compress(self, user_id: str, conv_id: str) -> None:
-        async with self._conversation_lock(user_id, conv_id):
-            await self._compress_locked(user_id, conv_id)
+    async def _compress(self, project_id: str, user_id: str, conv_id: str) -> None:
+        async with self._conversation_lock(project_id, user_id, conv_id):
+            await self._compress_locked(project_id, user_id, conv_id)
 
-    async def _compress_locked(self, user_id: str, conv_id: str) -> None:
+    async def _compress_locked(self, project_id: str, user_id: str, conv_id: str) -> None:
         """
         工作记忆压缩：
           1. 用 LLM 对旧消息生成摘要
@@ -291,7 +297,7 @@ class MemoryManager:
           3. 旧消息存入情景记忆（ChromaDB）供跨会话检索
           4. 工作记忆只保留最近 5 条
         """
-        messages = await self._get_working_memory(user_id, conv_id, limit=0)
+        messages = await self._get_working_memory(project_id, user_id, conv_id, limit=0)
         if len(messages) < self.COMPRESS_AT:
             return
 
@@ -313,14 +319,14 @@ class MemoryManager:
             return
 
         # 存摘要到 Redis
-        skey = self._summary_key(user_id, conv_id)
+        skey = self._summary_key(project_id, user_id, conv_id)
         old_summary = await self._redis.get(skey) or ""
         new_summary = await self._merge_summary(old_summary, summary)
         stored = await self._store_episodic(
-            user_id, conv_id, text, summary, source_ids=[m.message_id for m in to_compress])
+            project_id, user_id, conv_id, text, summary, source_ids=[m.message_id for m in to_compress])
         if not stored:
             return  # Do not discard history when archival storage failed.
-        key = self._wm_key(user_id, conv_id)
+        key = self._wm_key(project_id, user_id, conv_id)
         pipe = self._redis.pipeline(transaction=True)
         pipe.setex(skey, 86400, new_summary)
         pipe.ltrim(key, 0, 4)  # Keep existing serialized messages and IDs in their original order.
@@ -330,8 +336,9 @@ class MemoryManager:
 
     # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
-    async def _get_working_memory(self, user_id: str, conv_id: str, limit: Optional[int] = None) -> List[Message]:
-        key  = self._wm_key(user_id, conv_id)
+    async def _get_working_memory(self, project_id: str, user_id: str, conv_id: str,
+                                  limit: Optional[int] = None) -> List[Message]:
+        key  = self._wm_key(project_id, user_id, conv_id)
         end = -1 if limit == 0 else (limit or self.WORKING_MAX) - 1
         raws = await self._redis.lrange(key, 0, end)
         msgs = []
@@ -347,7 +354,7 @@ class MemoryManager:
             ))
         return msgs
 
-    async def _search_episodic(self, user_id: str, conv_id: str, query: str,
+    async def _search_episodic(self, project_id: str, user_id: str, conv_id: str, query: str,
                              top_k: Optional[int] = None, strict: bool = False) -> List[str]:
         """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
         query_text = self._safe_text(query).strip()
@@ -358,14 +365,16 @@ class MemoryManager:
             results = await self._query_episodic(
                 query_text,
                 n_results=count,
-                where={"$and": [{"user_id": self._safe_text(user_id)}, {"conv_id": self._safe_text(conv_id)}]},
+                where={"$and": [{"project_id": self._safe_text(project_id)},
+                                {"user_id": self._safe_text(user_id)}, {"conv_id": self._safe_text(conv_id)}]},
             )
             docs = self._extract_docs(results)
             if len(docs) < count:
                 fallback = await self._query_episodic(
                     query_text,
                     n_results=count,
-                    where={"user_id": self._safe_text(user_id)},
+                    where={"$and": [{"project_id": self._safe_text(project_id)},
+                                    {"user_id": self._safe_text(user_id)}]},
                 )
                 docs.extend(self._extract_docs(fallback))
             return self._dedupe_texts(docs)[:count]
@@ -375,22 +384,23 @@ class MemoryManager:
             logger.warning(f"情景记忆检索失败: {ex}")
             return []
 
-    async def _store_episodic(self, user_id: str, conv_id: str, text: str, summary: str,
+    async def _store_episodic(self, project_id: str, user_id: str, conv_id: str, text: str, summary: str,
                               source_ids: Optional[List[str]] = None) -> bool:
         """将压缩后的对话片段存入情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
         try:
+            project_id = self._safe_text(project_id)
             user_id = self._safe_text(user_id)
             conv_id = self._safe_text(conv_id)
             text = self._safe_text(text)
             summary = self._safe_text(summary)
-            identity = json.dumps([user_id, conv_id, source_ids or [text]], ensure_ascii=False)
+            identity = json.dumps([project_id, user_id, conv_id, source_ids or [text]], ensure_ascii=False)
             doc_id = hashlib.sha256(identity.encode()).hexdigest()
             # 直接传 documents，ChromaDB 内置模型自动生成 embedding
             await asyncio.to_thread(
                 self._episodic.upsert,
                 ids=[doc_id],
                 documents=[summary],
-                metadatas=[{"user_id": user_id, "conv_id": conv_id,
+                metadatas=[{"project_id": project_id, "user_id": user_id, "conv_id": conv_id,
                             "ts": datetime.now().isoformat(), "full_text": self._safe_text(text[:500]),
                             "source_message_ids": json.dumps(source_ids or [])}],
             )
@@ -399,25 +409,26 @@ class MemoryManager:
             logger.warning("存储情景记忆失败: %s", type(ex).__name__)
             return False
 
-    async def _get_profile(self, user_id: str, strict: bool = False) -> Dict[str, Any]:
+    async def _get_profile(self, project_id: str, user_id: str, strict: bool = False) -> Dict[str, Any]:
         try:
-            legacy = await self._get_legacy_profile(user_id, strict=True)
+            legacy = await self._get_legacy_profile(project_id, user_id, strict=True)
             evolution = getattr(self, "_evolution", None)
-            return await evolution.profile(user_id, legacy) if evolution is not None else legacy
+            return await evolution.profile(project_id, user_id, legacy) if evolution is not None else legacy
         except Exception:
             if strict:
                 raise
             return {}
 
-    async def _get_legacy_profile(self, user_id: str, strict: bool = False) -> Dict[str, Any]:
+    async def _get_legacy_profile(self, project_id: str, user_id: str, strict: bool = False) -> Dict[str, Any]:
         """获取用户画像（取最新一条）。"""
         try:
-            doc_id = self._profile_doc_id(user_id)
+            doc_id = self._profile_doc_id(project_id, user_id)
             direct = await asyncio.to_thread(self._profile.get, ids=[doc_id])
             if direct.get("documents"):
                 return json.loads(direct["documents"][0])
 
-            results = await asyncio.to_thread(self._profile.get, where={"user_id": user_id})
+            results = await asyncio.to_thread(self._profile.get, where={"$and": [
+                {"project_id": project_id}, {"user_id": user_id}]})
             return self._latest_profile_from_results(results)
         except Exception:
             if strict:
@@ -431,16 +442,16 @@ class MemoryManager:
         await self._redis.aclose()
 
     @staticmethod
-    def _wm_key(user_id: str, conv_id: str) -> str:
-        return f"wm:{user_id}:{conv_id}"
+    def _wm_key(project_id: str, user_id: str, conv_id: str) -> str:
+        return f"wm:{project_id}:{user_id}:{conv_id}"
 
     @staticmethod
-    def _summary_key(user_id: str, conv_id: str) -> str:
-        return f"summary:{user_id}:{conv_id}"
+    def _summary_key(project_id: str, user_id: str, conv_id: str) -> str:
+        return f"summary:{project_id}:{user_id}:{conv_id}"
 
     @classmethod
-    def _profile_doc_id(cls, user_id: str) -> str:
-        return f"{cls.PROFILE_DOC_PREFIX}{user_id}"
+    def _profile_doc_id(cls, project_id: str, user_id: str) -> str:
+        return f"{cls.PROFILE_DOC_PREFIX}{project_id}:{user_id}"
 
     @staticmethod
     def _safe_text(value: Any) -> str:
