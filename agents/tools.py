@@ -179,7 +179,8 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
 
     async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         query = str(args.get("query") or req.message or "").strip()
-        top_k = args.get("top_k", 5)
+        config = getattr(tool_manager, "rag_config", None)
+        top_k = args.get("top_k", getattr(config, "final_top_k", 3))
         if not query:
             return {"success": False, "error": "query 不能为空", "results": []}
         if req.retrieval_session is not None:

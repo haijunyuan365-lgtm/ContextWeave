@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -25,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content
+from mcp.rag_config import RAGConfig
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,7 @@ class Tool:
     timeout_s:   float = 30.0
     supports_rerank: bool = False            # 是否支持结果重排
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
+    embedding_provider: Optional[Callable] = None  # async (chunk_ids) -> {chunk_id: vector}
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
@@ -131,15 +134,17 @@ class MCPToolManager:
     MCP 工具调用框架。
 
     核心优化链路（针对检索类工具）：
-      用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
+      用户查询 → 查询改写 → 混合召回 → RRF → chunk ID 去重 → MMR → 重排 → Top-K
     """
 
-    def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
+    def __init__(self, api_key: str, base_url: Optional[str] = None,
+                 model: str = "claude-3-5-sonnet-20241022", rag_config: Optional[RAGConfig] = None):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
         self._client = AsyncAnthropic(**kwargs)
         self._model  = model
+        self.rag_config = rag_config or RAGConfig.from_env()
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
 
@@ -151,6 +156,15 @@ class MCPToolManager:
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+
+    def clear_cache(self, name: Optional[str] = None) -> None:
+        """Invalidate cached tool output after a backing data source changes."""
+        if name is None:
+            self._cache.clear()
+            return
+        prefix = name + ":"
+        for key in [key for key in self._cache if key.startswith(prefix)]:
+            del self._cache[key]
 
     # ── 核心调用 ──────────────────────────────────────────────────────────────
 
@@ -303,8 +317,11 @@ class MCPToolManager:
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             queries = json.loads(raw[s:e])
-            # 原始查询也保留，去重
-            return list(dict.fromkeys([query] + queries))
+            if not isinstance(queries, list):
+                raise ValueError("查询改写结果不是数组")
+            cleaned = [str(item).strip() for item in queries if isinstance(item, str) and item.strip()]
+            # 原始查询始终排在第一位，改写数量受 n 限制。
+            return list(dict.fromkeys([query.strip()] + cleaned))[:n + 1]
         except Exception as ex:
             logger.warning(f"查询改写失败，使用原始查询: {ex}")
             return [query]
@@ -313,50 +330,151 @@ class MCPToolManager:
         self,
         tool_name: str,
         query: str,
-        top_k: int = 5,
+        top_k: Optional[int] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         """
-        完整的检索优化链路：查询改写 → 并行召回 → 去重 → 重排 → Top-K
+        完整的检索优化链路：查询改写 → 混合召回 → RRF → 去重 → MMR → 重排 → Top-K
 
         这是解决"检索不全、召回不好"的完整方案。
         """
+        config = getattr(self, "rag_config", RAGConfig())
+        top_k = config.final_top_k if top_k is None else top_k
+        if type(top_k) is not int or not 1 <= top_k <= 20:
+            raise ValueError("top_k must be between 1 and 20")
+        timings: Dict[str, float] = {}
+
         # 1. 查询改写：生成多角度子查询
-        sub_queries = await self.rewrite_query(query, n=3)
+        started = time.monotonic()
+        sub_queries = await self.rewrite_query(query, n=config.rewrite_count)
+        timings["rewrite_ms"] = (time.monotonic() - started) * 1000
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
         # 2. 并行召回：所有子查询同时检索
-        recall_k = max(top_k, 5)
+        started = time.monotonic()
+        recall_k = max(top_k, config.recall_k)
         tasks = [
             self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
             for q in sub_queries
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        timings["retrieval_ms"] = (time.monotonic() - started) * 1000
 
-        # 3. 合并去重（按内容哈希去重）
-        seen, merged = set(), []
+        # 3. 按子查询排名做第二级加权 RRF，并按稳定 chunk_id 精确去重。
+        started = time.monotonic()
+        fused: Dict[str, Dict[str, Any]] = {}
+        fused_scores: Dict[str, float] = {}
+        fused_sources: Dict[str, set[str]] = {}
         degraded = False
-        for r in results:
+        successful_lists = 0
+        for query_index, r in enumerate(results):
             if not isinstance(r, ToolResult) or not r.success or r.error:
                 degraded = True
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
-                for item in r.data:
+                usable = [item for item in r.data if isinstance(item, dict) and not item.get("fallback")]
+                if usable:
+                    successful_lists += 1
+                weight = 1.0 if query_index == 0 else config.rewritten_query_weight
+                for rank, item in enumerate(usable, 1):
                     if isinstance(item, dict) and item.get("fallback"):
                         degraded = True
                         continue
-                    key = hashlib.md5(str(item).encode()).hexdigest()
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(item)
+                    chunk_id = self._chunk_identity(item)
+                    if chunk_id not in fused:
+                        fused[chunk_id] = dict(item, chunk_id=chunk_id)
+                        fused_scores[chunk_id] = 0.0
+                        fused_sources[chunk_id] = set()
+                    fused_scores[chunk_id] += weight / (config.rrf_k + rank)
+                    fused_sources[chunk_id].update(str(s) for s in item.get("retrieval_sources", []))
+
+        for chunk_id, item in fused.items():
+            item["score"] = round(fused_scores[chunk_id], 8)
+            item["retrieval_sources"] = sorted(fused_sources[chunk_id])
+        merged = sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))
+        timings["rrf_ms"] = (time.monotonic() - started) * 1000
 
         if not merged:
             return ToolResult(success=not degraded, data=[], tool_name=tool_name,
                               error="检索来源失败或降级" if degraded else None)
 
-        # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True,
+        # 4. 对有限候选做 MMR，再用 LLM 重排到最终 Top-K。
+        tool = getattr(self, "_tools", {}).get(tool_name)
+        rerank_limit = max(top_k, config.rerank_candidates)
+        mmr_pool = merged[:max(rerank_limit, config.mmr_candidates)]
+        started = time.monotonic()
+        diverse = await self._mmr_select(tool, mmr_pool, rerank_limit, config.mmr_lambda)
+        timings["mmr_ms"] = (time.monotonic() - started) * 1000
+        started = time.monotonic()
+        reranked = await self._rerank(query, diverse, top_k)
+        timings["rerank_ms"] = (time.monotonic() - started) * 1000
+        logger.info(
+            "rag_pipeline sub_queries=%d successful_lists=%d fused_count=%d mmr_count=%d final_count=%d "
+            "rewrite_ms=%.2f retrieval_ms=%.2f rrf_ms=%.2f mmr_ms=%.2f rerank_ms=%.2f degraded=%s",
+            len(sub_queries), successful_lists, len(merged), len(diverse), len(reranked),
+            timings["rewrite_ms"], timings["retrieval_ms"], timings["rrf_ms"],
+            timings["mmr_ms"], timings["rerank_ms"], degraded,
+        )
+        return ToolResult(success=True, data=reranked, tool_name=tool_name,
+                          reranked=len(diverse) > top_k,
                           error="部分检索来源失败或降级" if degraded else None)
+
+    @staticmethod
+    def _chunk_identity(item: Dict[str, Any]) -> str:
+        """Use the persisted ID; synthesize only for legacy/custom handlers."""
+        chunk_id = str(item.get("chunk_id") or "").strip()
+        if chunk_id:
+            return chunk_id
+        stable = json.dumps({
+            "title": item.get("title", ""), "content": item.get("content", ""),
+            "chunk": item.get("chunk", 0),
+        }, ensure_ascii=False, sort_keys=True)
+        return "legacy:" + hashlib.sha256(stable.encode()).hexdigest()
+
+    async def _mmr_select(self, tool: Optional[Tool], items: List[Dict[str, Any]],
+                          limit: int, relevance_weight: float) -> List[Dict[str, Any]]:
+        """Select a relevant but non-redundant pool using stored Chroma embeddings."""
+        limit = min(limit, len(items))
+        if limit <= 0:
+            return []
+        provider = tool.embedding_provider if tool is not None else None
+        if provider is None or len(items) <= 1:
+            return items[:limit]
+        try:
+            vectors = provider([str(item["chunk_id"]) for item in items])
+            if inspect.isawaitable(vectors):
+                vectors = await vectors
+            if not isinstance(vectors, dict) or any(str(item["chunk_id"]) not in vectors for item in items):
+                raise ValueError("候选 embedding 不完整")
+        except Exception as ex:
+            logger.warning("MMR embedding 获取失败，保留 RRF 排序: %s", ex)
+            return items[:limit]
+
+        scores = [float(item.get("score", 0.0)) for item in items]
+        low, high = min(scores), max(scores)
+        relevance = [1.0 if high == low else (score - low) / (high - low) for score in scores]
+        selected: List[int] = []
+        remaining = list(range(len(items)))
+        while remaining and len(selected) < limit:
+            best_index, best_score = remaining[0], -math.inf
+            for index in remaining:
+                vector = vectors[str(items[index]["chunk_id"])]
+                redundancy = max((max(0.0, self._cosine(vector, vectors[str(items[i]["chunk_id"])]))
+                                  for i in selected), default=0.0)
+                score = relevance_weight * relevance[index] - (1.0 - relevance_weight) * redundancy
+                if score > best_score:
+                    best_index, best_score = index, score
+            selected.append(best_index)
+            remaining.remove(best_index)
+        return [items[index] for index in selected]
+
+    @staticmethod
+    def _cosine(left: List[float], right: List[float]) -> float:
+        if not left or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
@@ -389,9 +507,17 @@ class MCPToolManager:
             )
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
-            order: List[int] = json.loads(raw[s:e])
-            reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
+            order = json.loads(raw[s:e])
+            if not isinstance(order, list):
+                raise ValueError("重排结果不是数组")
+            valid: List[int] = []
+            seen = set()
+            for index in order:
+                if type(index) is int and 0 <= index < len(items) and index not in seen:
+                    valid.append(index)
+                    seen.add(index)
+            valid.extend(index for index in range(len(items)) if index not in seen)
+            return [items[index] for index in valid[:top_k]]
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
             return items[:top_k]

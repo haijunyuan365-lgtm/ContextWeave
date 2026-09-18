@@ -71,7 +71,7 @@ def test_same_request_single_flight_and_distinct_arguments():
         assert sum(r.cached for r in results) == 2
         await session.retrieve("knowledge", "refund policy", 3)
         await session.retrieve("knowledge", "another query")
-        assert rag.search_with_rewrite.await_count == 3
+        assert rag.search_with_rewrite.await_count == 2
         results[0].data[0]["content"] = "mutated"
         assert (await session.retrieve("knowledge", "refund policy")).data[0]["content"] == "退款规则"
         await session.close()

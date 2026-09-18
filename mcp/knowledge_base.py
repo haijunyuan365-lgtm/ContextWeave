@@ -3,7 +3,7 @@ RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 
 功能：
   1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
-  2. 语义检索：根据 query 从知识库中检索最相关的文档片段
+  2. 混合检索：Chroma 向量召回 + 中文 BM25 + RRF 融合
   3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
 
 ChromaDB 在这里的角色：
@@ -14,16 +14,23 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
+import re
+import threading
+import time
+import unicodedata
 from typing import Any, Dict, List, Optional
 
-import chromadb
+import jieba
+from rank_bm25 import BM25Okapi
+
+from mcp.rag_config import RAGConfig
 
 logger = logging.getLogger(__name__)
 
 
 class KnowledgeBase:
     """
-    基于 ChromaDB 的 RAG 知识库。
+    基于 ChromaDB 与进程内 BM25 的 RAG 知识库。
 
     ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
     调用 add() 时自动生成向量，query() 时自动做语义匹配。
@@ -37,7 +44,14 @@ class KnowledgeBase:
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
+        rag_config: Optional[RAGConfig] = None,
     ):
+        import chromadb
+
+        self.rag_config = rag_config or RAGConfig.from_env()
+        self._bm25_lock = threading.RLock()
+        self._bm25: Optional[BM25Okapi] = None
+        self._bm25_items: tuple[Dict[str, Any], ...] = ()
         # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
         self._use_server = False
         try:
@@ -67,6 +81,8 @@ class KnowledgeBase:
         # 如果知识库为空，导入默认文档
         if self._collection.count() == 0:
             self._load_default_docs()
+        else:
+            self._rebuild_bm25_index()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -93,6 +109,7 @@ class KnowledgeBase:
         if ids:
             # ChromaDB 会自动生成 Embedding
             self._collection.add(ids=ids, documents=docs, metadatas=metas)
+            self._rebuild_bm25_index()
             logger.info(f"知识库导入 {len(ids)} 个文档片段")
 
         return len(ids)
@@ -101,36 +118,140 @@ class KnowledgeBase:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
         return await asyncio.to_thread(self.add_documents, documents)
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        语义检索：根据 query 返回最相关的文档片段。
-
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
-        """
+    def _vector_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Return the vector-ranked branch with stable Chroma chunk IDs."""
+        count = self._collection.count()
+        if not count:
+            return []
         results = self._collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=min(top_k, count),
+            include=["documents", "metadatas", "distances"],
         )
 
-        items = []
+        items: List[Dict[str, Any]] = []
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
+            for chunk_id, doc, meta, dist in zip(
+                results["ids"][0],
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
                 items.append({
+                    "chunk_id": chunk_id,
                     "title":    meta.get("title", ""),
                     "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
+                    "score":    round(1.0 - dist, 6),
+                    "vector_score": round(1.0 - dist, 6),
                     "chunk":    meta.get("chunk_index", 0),
+                    "retrieval_sources": ["vector"],
                 })
-
         return items
 
-    async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
-        return await asyncio.to_thread(self.search, query, top_k)
+    def _bm25_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Return the lexical branch from an immutable in-memory snapshot."""
+        tokens = self._tokenize(query)
+        if not tokens:
+            return []
+        with self._bm25_lock:
+            bm25, items = self._bm25, self._bm25_items
+        if bm25 is None or not items:
+            return []
+        scores = bm25.get_scores(tokens)
+        ranked = sorted(enumerate(scores), key=lambda pair: (-float(pair[1]), pair[0]))
+        output: List[Dict[str, Any]] = []
+        for index, score in ranked:
+            if not any(token in bm25.doc_freqs[index] for token in tokens):
+                continue
+            item = dict(items[index])
+            item.update(score=round(float(score), 6), bm25_score=round(float(score), 6),
+                        retrieval_sources=["bm25"])
+            output.append(item)
+            if len(output) >= top_k:
+                break
+        return output
+
+    def _rrf_fuse(self, branches: List[tuple[str, List[Dict[str, Any]]]], top_k: int) -> List[Dict[str, Any]]:
+        """Fuse vector and BM25 ranks without comparing their incompatible scores."""
+        fused: Dict[str, Dict[str, Any]] = {}
+        source_sets: Dict[str, set[str]] = {}
+        rrf_scores: Dict[str, float] = {}
+        for source, items in branches:
+            for rank, item in enumerate(items, 1):
+                chunk_id = str(item["chunk_id"])
+                if chunk_id not in fused:
+                    fused[chunk_id] = dict(item)
+                    source_sets[chunk_id] = set()
+                    rrf_scores[chunk_id] = 0.0
+                source_sets[chunk_id].update(item.get("retrieval_sources", [source]))
+                rrf_scores[chunk_id] += 1.0 / (self.rag_config.rrf_k + rank)
+                if source == "vector" and "vector_score" in item:
+                    fused[chunk_id]["vector_score"] = item["vector_score"]
+                if source == "bm25" and "bm25_score" in item:
+                    fused[chunk_id]["bm25_score"] = item["bm25_score"]
+
+        for chunk_id, item in fused.items():
+            item["score"] = round(rrf_scores[chunk_id], 8)
+            item["retrieval_sources"] = sorted(source_sets[chunk_id])
+        return sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))[:top_k]
+
+    def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+        """Synchronous hybrid retrieval, retained for direct callers."""
+        branches: List[tuple[str, List[Dict[str, Any]]]] = []
+        errors = []
+        for source, searcher in (("vector", self._vector_search), ("bm25", self._bm25_search)):
+            try:
+                branches.append((source, searcher(query, top_k)))
+            except Exception as ex:
+                errors.append(f"{source}: {ex}")
+                logger.warning("knowledge_%s_search_failed", source, exc_info=True)
+        if errors and not branches:
+            raise RuntimeError("; ".join(errors))
+        return self._rrf_fuse(branches, top_k)
+
+    async def search_async(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+        """Run Chroma and BM25 concurrently, degrading to either healthy branch."""
+        started = time.monotonic()
+        results = await asyncio.gather(
+            asyncio.to_thread(self._vector_search, query, top_k),
+            asyncio.to_thread(self._bm25_search, query, top_k),
+            return_exceptions=True,
+        )
+        branches: List[tuple[str, List[Dict[str, Any]]]] = []
+        failures = []
+        for source, result in zip(("vector", "bm25"), results):
+            if isinstance(result, BaseException):
+                failures.append(source)
+                logger.warning("knowledge_%s_search_failed error_type=%s", source, type(result).__name__)
+            else:
+                branches.append((source, result))
+        if failures and not branches:
+            raise RuntimeError("all hybrid retrieval branches failed")
+        fused = self._rrf_fuse(branches, top_k)
+        logger.info(
+            "rag_hybrid query_chars=%d vector_count=%d bm25_count=%d fused_count=%d failures=%s latency_ms=%.2f",
+            len(query), len(results[0]) if isinstance(results[0], list) else 0,
+            len(results[1]) if isinstance(results[1], list) else 0, len(fused), failures,
+            (time.monotonic() - started) * 1000,
+        )
+        return fused
+
+    def get_embeddings(self, chunk_ids: List[str]) -> Dict[str, List[float]]:
+        """Fetch stored vectors for MMR without exposing them in search results."""
+        if not chunk_ids:
+            return {}
+        results = self._collection.get(ids=chunk_ids, include=["embeddings"])
+        embeddings = results.get("embeddings")
+        if embeddings is None:
+            return {}
+        return {
+            str(chunk_id): [float(value) for value in embedding]
+            for chunk_id, embedding in zip(results.get("ids") or [], embeddings)
+            if embedding is not None
+        }
+
+    async def get_embeddings_async(self, chunk_ids: List[str]) -> Dict[str, List[float]]:
+        return await asyncio.to_thread(self.get_embeddings, chunk_ids)
 
     @property
     def doc_count(self) -> int:
@@ -153,10 +274,51 @@ class KnowledgeBase:
         ))
         """
         query = params.get("query", "")
-        top_k = params.get("top_k", 5)
+        top_k = params.get("top_k", self.rag_config.recall_k)
+        if type(top_k) is not int or not 1 <= top_k <= 100:
+            raise ValueError("top_k must be between 1 and 100")
         return await self.search_async(query, top_k=top_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+        tokens = [
+            token.strip() for token in jieba.cut_for_search(normalized)
+            if token.strip() and re.search(r"[\w\u4e00-\u9fff]", token, re.UNICODE)
+        ]
+        # jieba may split identifiers such as ZX-900; retain their exact normalized form too.
+        tokens.extend(re.findall(r"[a-z0-9]+(?:[-_.:/][a-z0-9]+)+", normalized))
+        return tokens
+
+    def _rebuild_bm25_index(self) -> None:
+        """Build a fresh snapshot, then atomically publish it to readers."""
+        started = time.monotonic()
+        result = self._collection.get(include=["documents", "metadatas"])
+        items: List[Dict[str, Any]] = []
+        corpus: List[List[str]] = []
+        for chunk_id, document, metadata in zip(
+            result.get("ids") or [], result.get("documents") or [], result.get("metadatas") or []
+        ):
+            metadata = metadata or {}
+            title = str(metadata.get("title", ""))
+            content = str(document or "")
+            tokens = self._tokenize(title) * 2 + self._tokenize(content)
+            if not tokens:
+                continue
+            items.append({
+                "chunk_id": str(chunk_id),
+                "title": title,
+                "content": content,
+                "chunk": metadata.get("chunk_index", 0),
+            })
+            corpus.append(tokens)
+        bm25 = BM25Okapi(corpus) if corpus else None
+        with self._bm25_lock:
+            self._bm25, self._bm25_items = bm25, tuple(items)
+        logger.info("bm25_index_rebuilt chunks=%d latency_ms=%.2f", len(items),
+                    (time.monotonic() - started) * 1000)
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
         """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""

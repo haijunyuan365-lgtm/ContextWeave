@@ -126,16 +126,20 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
+    # MCP 工具管理器 + RAG 知识库（Chroma Vector + 进程内 BM25）
+    from mcp.rag_config import RAGConfig
+    rag_config = RAGConfig.from_env()
     _tool_manager = MCPToolManager(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+        rag_config=rag_config,
     )
     kb = KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        rag_config=rag_config,
     )
     logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
 
@@ -164,6 +168,7 @@ async def lifespan(app: FastAPI):
         cache_ttl=300.0,
         supports_rerank=True,
         fallback=knowledge_fallback,
+        embedding_provider=kb.get_embeddings_async,
     ))
     if _orchestrator is not None:
         _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
@@ -429,13 +434,14 @@ async def prometheus_metrics():
 
 
 @app.post("/search")
-async def search(query: str, top_k: int = 5):
+async def search(query: str, top_k: Optional[int] = Query(default=None, ge=1, le=20)):
     """
-    演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
+    演示检索优化链路：查询改写 → Vector/BM25 → RRF → MMR → 重排 → Top-K。
     展示 MCP 工具调用的核心亮点。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
+    top_k = _tool_manager.rag_config.final_top_k if top_k is None else top_k
     result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
     return {"query": query, "results": result.data, "reranked": result.reranked}
 
@@ -494,6 +500,7 @@ async def add_knowledge(body: BatchDocInput):
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
     count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    _tool_manager.clear_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
 
@@ -535,6 +542,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
         docs = [{"title": title, "content": text}]
 
     count = await kb.add_documents_async(docs)
+    _tool_manager.clear_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {
         "message": f"文件 {filename} 导入成功",

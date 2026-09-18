@@ -157,6 +157,19 @@ HTTP 与 CLI 共用采集、检索和后台处理模块。第一版限单应用�
 - `POST /knowledge/upload`
 - `GET /knowledge/stats`
 
+知识检索采用多查询改写、Chroma Vector + BM25、两级 RRF、chunk ID 去重、MMR 和 LLM 重排。可选配置：
+
+| 环境变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `ECHOMIND_RAG_TOP_K` | `3` | 最终返回并注入 Agent 的结果数 |
+| `ECHOMIND_RAG_RECALL_K` | `10` | 每个子查询、每种召回通道的候选数 |
+| `ECHOMIND_RAG_RRF_K` | `60` | RRF 排名平滑常数 |
+| `ECHOMIND_RAG_MMR_CANDIDATES` | `24` | 进入 MMR 的 RRF 候选数 |
+| `ECHOMIND_RAG_RERANK_CANDIDATES` | `12` | 进入 LLM rerank 的候选数 |
+| `ECHOMIND_RAG_MMR_LAMBDA` | `0.8` | MMR 的相关性权重 |
+| `ECHOMIND_RAG_REWRITE_COUNT` | `3` | 查询改写数量 |
+| `ECHOMIND_RAG_REWRITE_WEIGHT` | `0.7` | 改写查询相对原始查询的融合权重 |
+
 ### Skills
 
 - `GET /skills`

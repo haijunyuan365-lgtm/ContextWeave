@@ -51,7 +51,7 @@ class ContextBundle:
         if self.knowledge:
             parts.append("[知识库检索结果]\n" + "\n".join(
                 f"{i}. {item.get('title', '未命名文档')}\n{str(item['content'])[:600]}"
-                for i, item in enumerate(self.knowledge[:5], 1)))
+                for i, item in enumerate(self.knowledge, 1)))
         if self.experiences:
             from experience.runtime import format_references
             parts.append(format_references(self.experiences))
@@ -76,9 +76,12 @@ class RetrievalSession:
         self._pending: dict[tuple, asyncio.Task] = {}
         self.knowledge_used = False
 
-    async def retrieve(self, source: str, query: str = "", top_k: int = 5) -> RetrievalResult:
+    async def retrieve(self, source: str, query: str = "", top_k: int | None = None) -> RetrievalResult:
         if source not in {"memory", "profile", "knowledge", "experience"}:
             raise ValueError("unsupported retrieval source")
+        if top_k is None:
+            config = getattr(self.knowledge, "rag_config", None) if source == "knowledge" else None
+            top_k = getattr(config, "final_top_k", 3) if source == "knowledge" else 5
         maximum = 5 if source == "memory" else 20
         if source == "experience":
             top_k = min(top_k, 3) if type(top_k) is int else top_k
