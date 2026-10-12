@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.context_planner import ContextPlan, LightweightContext, SOURCES
+from observability import observed, traced, set_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -187,22 +188,33 @@ class ContextPipeline:
         self.memory, self.knowledge, self.skills = memory, knowledge, skills
         self.experience = experience
 
+    @traced("context.prepare")
     async def prepare(self, req: Any) -> Any:
         light_started = time.monotonic()
         light_failed = False
-        try:
-            light = (await self.memory.get_lightweight_context(req.user_id, req.conv_id)
-                     if self.memory is not None else LightweightContext((req.history or [])[-5:]))
-        except Exception:
-            light = LightweightContext((req.history or [])[-5:])
-            light_failed = True
+        with observed("memory.load_lightweight", span_type="memory") as span:
+            try:
+                light = (await self.memory.get_lightweight_context(req.user_id, req.conv_id)
+                         if self.memory is not None else LightweightContext((req.history or [])[-5:]))
+            except Exception:
+                light = LightweightContext((req.history or [])[-5:])
+                light_failed = True
+                set_outcome(span, "degraded", fallback=True, code="MEMORY_READ_FAILED")
         light_ms = round((time.monotonic() - light_started) * 1000, 2)
-        intent = await self.orchestrator.recognize_intent(req.message, history=light.recent_history or None,
-                                                         summary=light.summary)
+        with observed("intent.recognize", span_type="intent") as span:
+            intent = await self.orchestrator.recognize_intent(req.message, history=light.recent_history or None,
+                                                             summary=light.summary)
+            span.set_attribute("app.intent.name", intent.intent.value)
+            span.set_attribute("app.intent.confidence", intent.confidence)
         req.history = light.recent_history or None
         req.intent, req.intent_group = intent.intent, intent.intent_group
         req.intent_confidence, req.urgency, req.entities = intent.confidence, intent.urgency, intent.entities
-        req.context_plan = await self.planner.plan(req.message, intent, light)
+        with observed("context.plan") as span:
+            req.context_plan = await self.planner.plan(req.message, intent, light)
+            span.set_attribute("app.context.planner_source", req.context_plan.planner_source)
+            span.set_attribute("app.context.sources", [s for s in SOURCES if getattr(req.context_plan, "need_" + s)])
+            if req.context_plan.planner_source == "fallback":
+                set_outcome(span, "degraded", fallback=True)
         bundle = ContextBundle(recent_history=light.recent_history, summary=light.summary)
         for source, data in (("recent_history", light.recent_history), ("summary", light.summary)):
             bundle.sources[source] = {
@@ -221,24 +233,32 @@ class ContextPipeline:
                 setattr(bundle, attr, result.data)
 
         try:
-            await asyncio.gather(*(preload(s, getattr(plan, s + "_query", None) or req.message)
-                                   for s in ("memory", "profile", "knowledge", "experience") if getattr(plan, "need_" + s)))
+            with observed("context.retrieve") as span:
+                await asyncio.gather(*(preload(s, getattr(plan, s + "_query", None) or req.message)
+                                       for s in ("memory", "profile", "knowledge", "experience") if getattr(plan, "need_" + s)))
+                if any(stat["status"] in {"failed", "degraded"} for stat in bundle.sources.values()):
+                    set_outcome(span, "degraded", fallback=True, code="CONTEXT_SOURCE_FAILED")
             if plan.need_skill:
-                started = time.monotonic()
-                stat = bundle.sources["skill"]
-                stat["calls"] = 1
-                if self.skills is None:
-                    stat["status"] = "unconfigured"
-                else:
-                    try:
-                        bundle.skills = self.skills.select(req.message)
-                        bundle.skill_prompts = {role: self.skills.format_skills(
-                            [s for s in bundle.skills if not s.agents or role in s.agents])
-                            for role in ("general", "billing", "technical", "escalation")}
-                        stat.update(status="success" if bundle.skills else "empty", count=len(bundle.skills))
-                    except Exception:
-                        stat["status"] = "failed"
-                stat["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
+                with observed("context.skills") as span:
+                    started = time.monotonic()
+                    stat = bundle.sources["skill"]
+                    stat["calls"] = 1
+                    if self.skills is None:
+                        stat["status"] = "unconfigured"
+                    else:
+                        try:
+                            bundle.skills = self.skills.select(req.message)
+                            bundle.skill_prompts = {role: self.skills.format_skills(
+                                [s for s in bundle.skills if not s.agents or role in s.agents])
+                                for role in ("general", "billing", "technical", "escalation")}
+                            stat.update(status="success" if bundle.skills else "empty", count=len(bundle.skills))
+                        except Exception:
+                            stat["status"] = "failed"
+                    stat["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
+                    if stat["status"] == "failed":
+                        set_outcome(span, "degraded", code="SKILL_LOAD_FAILED")
+                    elif stat["status"] == "unconfigured":
+                        set_outcome(span, "skipped")
             req.context = bundle.to_prompt_text()
             return intent
         except BaseException:
@@ -252,11 +272,15 @@ class ContextPipeline:
             await self.planner.client.close()
 
     async def capture(self, req: Any, result: Any) -> None:
-        if self.experience is not None:
-            try:
-                await self.experience.submit(req, result)
-            except Exception:
-                logger.warning("experience_capture_failed request_id=%s", req.request_id)
+        with observed("experience.submit", span_type="experience") as span:
+            if self.experience is None:
+                set_outcome(span, "skipped")
+            else:
+                try:
+                    await self.experience.submit(req, result)
+                except Exception:
+                    set_outcome(span, "degraded", code="EXPERIENCE_SUBMIT_FAILED")
+                    logger.warning("experience_capture_failed request_id=%s", req.request_id)
 
 
 def context_debug(req: Any) -> dict[str, Any]:

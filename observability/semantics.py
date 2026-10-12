@@ -1,0 +1,12 @@
+"""Stable application semantics; OTel owns trace/span IDs and timestamps."""
+REQUEST_ID = "app.request_id"
+OPERATION = "app.operation"
+SPAN_TYPE = "app.span_type"
+OUTCOME = "app.outcome"
+ERROR_CODE = "app.error_code"
+FALLBACK_USED = "app.fallback_used"
+
+SUCCESS = "success"
+ERROR = "error"
+DEGRADED = "degraded"
+SKIPPED = "skipped"

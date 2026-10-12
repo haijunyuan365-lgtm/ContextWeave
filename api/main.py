@@ -9,6 +9,7 @@ import logging
 import os
 import pathlib
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Literal
@@ -24,13 +25,19 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from observability import observed, request_context, correlation_ids, set_outcome
+from observability.bootstrap import configure_tracing, configure_logging, shutdown_tracing
+from observability.sanitization import hash_identifier
 
 load_dotenv()
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s request_id=%(request_id)s trace_id=%(trace_id)s span_id=%(span_id)s: %(message)s",
 )
+configure_logging()
 logger = logging.getLogger(__name__)
 
 BANNER = r"""
@@ -76,6 +83,16 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_tracing()
+    try:
+        async with _service_lifespan(app):
+            yield
+    finally:
+        await asyncio.to_thread(shutdown_tracing)
+
+
+@asynccontextmanager
+async def _service_lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _context_pipeline
 
     print(BANNER, flush=True)
@@ -201,11 +218,15 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await _monitor.stop()
-        if _context_pipeline is not None:
-            await _context_pipeline.close()
-        if _memory is not None:
-            await _memory.close()
+        try:
+            await _monitor.stop()
+        finally:
+            try:
+                if _context_pipeline is not None:
+                    await _context_pipeline.close()
+            finally:
+                if _memory is not None:
+                    await _memory.close()
         logger.info("EchoMind 已关闭")
 
 
@@ -222,6 +243,12 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Install before the middleware stack is built; all business spans use this same provider.
+FastAPIInstrumentor.instrument_app(
+    app, tracer_provider=configure_tracing(), exclude_spans=["receive", "send"],
+    http_capture_headers_server_request=[], http_capture_headers_server_response=[],
 )
 
 
@@ -248,6 +275,8 @@ class ChatResponse(BaseModel):
     routing_confidence: float = 0.0
     escalated:   bool
     latency_ms:  float
+    trace_id:    str = ""
+    request_duration_ms: float = 0.0
     knowledge_used: bool = False
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
@@ -308,40 +337,73 @@ async def chat(req: ChatRequest):
     conv_id = req.conv_id or str(uuid.uuid4())
 
     orch_req = OrcReq(message=req.message, user_id=req.user_id, conv_id=conv_id)
-    source = await _memory.begin_turn(req.user_id, conv_id, req.message)
-    intent_result = await _context_pipeline.prepare(orch_req)
-    try:
-        result = await _orchestrator.run(orch_req)
-        await _context_pipeline.capture(orch_req, result)
-    finally:
-        log_context(orch_req)
-        await orch_req.retrieval_session.close()
+    started = time.monotonic()
+    with request_context(orch_req.request_id):
+        # Associate the existing HTTP server span before creating the business child.
+        trace.get_current_span().set_attribute("app.request_id", orch_req.request_id)
+        with observed("chat.pipeline", span_type="request",
+                      **{"app.conversation.hash": hash_identifier(conv_id)}) as span:
+            failed = False
+            try:
+                try:
+                    with observed("memory.begin_turn", span_type="memory"):
+                        source = await _memory.begin_turn(req.user_id, conv_id, req.message)
+                    intent_result = await _context_pipeline.prepare(orch_req)
+                    result = await _orchestrator.run(orch_req)
+                    await _context_pipeline.capture(orch_req, result)
+                except BaseException:
+                    failed = True
+                    raise
+                finally:
+                    try:
+                        with observed("context.cleanup"):
+                            try:
+                                if orch_req.context_plan is not None and orch_req.context_bundle is not None:
+                                    log_context(orch_req)
+                            finally:
+                                if orch_req.retrieval_session is not None:
+                                    await orch_req.retrieval_session.close()
+                    except Exception:
+                        if not failed:
+                            raise
+                        logger.warning("chat_cleanup_failed")
 
-    # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message, source=source)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
+                with observed("memory.persist", span_type="memory"):
+                    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message, source=source)
+                    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response, source=source)
 
-    return ChatResponse(
-        conv_id=conv_id,
-        request_id=result.request_id,
-        response=result.response,
-        intent=result.intent.value if result.intent else "other",
-        intent_group=intent_result.intent_group,
-        agent_type=result.agent_type.value,
-        agent_types=[agent_type.value for agent_type in result.agent_types],
-        primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
-        supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
-        tools_used=result.tools_used,
-        routing_reason=result.routing_reason,
-        routing_confidence=result.routing_confidence,
-        escalated=result.escalated,
-        latency_ms=round(result.latency_ms, 1),
-        knowledge_used=orch_req.retrieval_session.knowledge_used,
-        entities=intent_result.entities,
-        intent_confidence=round(intent_result.confidence, 4),
-        intent_source_scores=intent_result.source_scores,
-        **({"context_debug": context_debug(orch_req)} if req.debug_context else {}),
-    )
+                records = orch_req.execution_records
+                if records and not any(r["success"] for r in records):
+                    set_outcome(span, "error", code="AGENT_FAILED")
+                elif any(not r["success"] or r["fallback"] for r in records):
+                    set_outcome(span, "degraded", fallback=any(r["fallback"] for r in records))
+                logger.info("chat_completed")
+                return ChatResponse(
+                    conv_id=conv_id,
+                    request_id=result.request_id,
+                    response=result.response,
+                    intent=result.intent.value if result.intent else "other",
+                    intent_group=intent_result.intent_group,
+                    agent_type=result.agent_type.value,
+                    agent_types=[agent_type.value for agent_type in result.agent_types],
+                    primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
+                    supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
+                    tools_used=result.tools_used,
+                    routing_reason=result.routing_reason,
+                    routing_confidence=result.routing_confidence,
+                    escalated=result.escalated,
+                    latency_ms=round(result.latency_ms, 1),
+                    trace_id=correlation_ids()["trace_id"],
+                    request_duration_ms=round((time.monotonic() - started) * 1000, 1),
+                    knowledge_used=orch_req.retrieval_session.knowledge_used,
+                    entities=intent_result.entities,
+                    intent_confidence=round(intent_result.confidence, 4),
+                    intent_source_scores=intent_result.source_scores,
+                    **({"context_debug": context_debug(orch_req)} if req.debug_context else {}),
+                )
+            finally:
+                span.set_attribute("app.request.duration_ms", (time.monotonic() - started) * 1000)
+
 
 
 class ExperienceFeedback(BaseModel):

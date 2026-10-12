@@ -43,6 +43,7 @@ from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLeve
 from core.llm_utils import extract_text_content
 from core.context_planner import ContextPlan
 from core.context_runtime import ContextBundle, RetrievalSession
+from observability import observed, request_context, set_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -759,6 +760,18 @@ class AgentOrchestrator:
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
     async def run(self, req: Request) -> OrchestratorResult:
+        with request_context(req.request_id), observed("agent.orchestrate", span_type="agent") as span:
+            result = await self._run(req)
+            span.set_attribute("app.agent.name", result.agent_type.value)
+            span.set_attribute("app.agent.multi_agent", len(result.agent_types) > 1)
+            span.set_attribute("app.agent.escalated", result.escalated)
+            if req.execution_records and not any(r["success"] for r in req.execution_records):
+                set_outcome(span, "error", code="AGENT_FAILED")
+            elif any(not record["success"] or record["fallback"] for record in req.execution_records):
+                set_outcome(span, "degraded", fallback=any(r["fallback"] for r in req.execution_records))
+            return result
+
+    async def _run(self, req: Request) -> OrchestratorResult:
         """
         处理一次请求的完整流程：
           意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
@@ -767,7 +780,8 @@ class AgentOrchestrator:
 
         # 1. 意图识别（如果调用方已识别则跳过）
         if req.intent is None:
-            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
+            with observed("intent.recognize", span_type="intent"):
+                intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
             req.intent  = intent_result.intent
             req.intent_group = intent_result.intent_group
             req.urgency = intent_result.urgency
@@ -790,7 +804,11 @@ class AgentOrchestrator:
             return result
 
         # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
-        decision = self._route_decision(req)
+        with observed("agent.route", span_type="agent") as span:
+            decision = self._route_decision(req)
+            span.set_attribute("app.agent.name", decision.primary_agent.value)
+            span.set_attribute("app.agent.multi_agent", decision.multi_agent)
+            span.set_attribute("app.agent.routing_confidence", decision.confidence)
         if decision.multi_agent:
             return await self.run_parallel(req, decision)
 
@@ -839,7 +857,9 @@ class AgentOrchestrator:
                 req.execution_records.append({"agent_type": agent_type.value, "success": False, "fallback": False})
 
         valid_responses = [r for r in responses if isinstance(r, AgentResponse)]
-        combined = await self._composer.compose(req, valid_responses)
+        with observed("agent.compose", span_type="agent") as span:
+            span.set_attribute("app.agent.response_count", len(valid_responses))
+            combined = await self._composer.compose(req, valid_responses)
         escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
         tools_used = list(dict.fromkeys(
             tool_name
@@ -1085,6 +1105,16 @@ class AgentOrchestrator:
         return max(agents, key=lambda a: a.stats.routing_score())
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
+        with observed("agent.execute", span_type="agent", **{"app.agent.name": agent_type.value}) as span:
+            response = await self._execute_agent(req, agent_type)
+            fallback = response.agent_type != agent_type
+            if not response.success:
+                set_outcome(span, "error", fallback=fallback, code="AGENT_FAILED")
+            elif fallback:
+                set_outcome(span, "degraded", fallback=True)
+            return response
+
+    async def _execute_agent(self, req: Request, agent_type: AgentType) -> AgentResponse:
         """执行 Agent，失败时降级到 GeneralAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
