@@ -216,6 +216,7 @@ class BaseAgent:
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
+        annotate(**{"app.agent.stats_counted": True, "app.agent.stats_latency_ms": 0.0})
         annotate(**{"app.agent.name": self.agent_type.value, "app.agent.role": self.profile.role})
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
@@ -224,6 +225,7 @@ class BaseAgent:
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
+            annotate(**{"app.agent.stats_latency_ms": ms})
             escalate = self._needs_escalation(content)
             annotate(**{"app.agent.success": True, "app.agent.escalated": escalate})
             return AgentResponse(
@@ -238,6 +240,7 @@ class BaseAgent:
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
             self.stats.total_ms += ms
+            annotate(**{"app.agent.stats_latency_ms": ms})
             annotate(**{"app.agent.success": False})
             outcome("error", code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "AGENT_FAILED")
             logger.error(f"{self.agent_type.value} 处理失败: {ex}")
@@ -579,6 +582,7 @@ class EscalationAgent(BaseAgent):
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
+        annotate(**{"app.agent.stats_counted": True, "app.agent.stats_latency_ms": 0.0})
         annotate(**{"app.agent.name": self.agent_type.value, "app.agent.role": self.profile.role})
         annotate(**{"app.agent.success": True, "app.agent.escalated": True})
         intent = req.intent.value if req.intent else "unknown"
@@ -593,6 +597,7 @@ class EscalationAgent(BaseAgent):
         ms = (time.monotonic() - t0) * 1000
         self.stats.success += 1
         self.stats.total_ms += ms
+        annotate(**{"app.agent.stats_latency_ms": ms})
         return AgentResponse(
             agent_type=self.agent_type,
             content=content,
@@ -706,6 +711,8 @@ class AgentOrchestrator:
         self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
+
+        self._metrics_owner = str(uuid.uuid4())
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -1148,7 +1155,9 @@ class AgentOrchestrator:
 
     async def _handle_agent(self, req: Request, agent: BaseAgent, requested: AgentType,
                             fallback: bool = False) -> AgentResponse:
+        instance = next((i for i, candidate in enumerate(self._pool.get(agent.agent_type, [])) if candidate is agent), 0)
         with observed("agent.execute", span_type="agent", **{
+                "app.agent.instance": f"{agent.agent_type.value}_{instance}", "app.agent.monitor_owner": self._metrics_owner,
                 "app.agent.name": agent.agent_type.value, "app.agent.role": agent.profile.role,
                 "app.agent.requested_name": requested.value}) as span:
             response = await agent.handle(req)

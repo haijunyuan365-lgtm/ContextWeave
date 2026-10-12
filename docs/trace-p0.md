@@ -61,7 +61,7 @@ OTEL_EXPORTER_OTLP_TIMEOUT=3
 
 调用 /chat 后，用响应的 request_id / trace_id 在 docker compose logs -f echomind 中定位日志和 Span JSON。parent_id / context.span_id 可还原树，start_time / end_time 定位耗时。默认每 5 秒批量输出，正常退出尝试 flush。
 
-OTEL_TRACES_EXPORTER=none 保留上下文和 ID，但没有出口。OTEL_SDK_DISABLED=true 停止采集，trace_id 可能为空或只来自上游上下文。初始化失败降为 NoOp，日志记录 trace_setup_failed，业务可继续。配置在进程初始化时读取，修改后重启；Provider 生命周期与服务进程相同。
+OTEL_TRACES_EXPORTER=none 保留上下文和 ID，但没有出口。OTEL_SDK_DISABLED=true 停止采集，trace_id 可能为空或只来自上游上下文。SDK 初始化失败才降为 NoOp；出口初始化失败保留本地指标，日志记录 trace_setup_failed。配置在进程初始化时读取，修改后重启；Provider 生命周期与服务进程相同。
 
 本阶段没有新增历史 Trace API，也没有部署 Collector / Langfuse；旧 /trace/tool/{request_id} 仍返回旧工具视图。
 
@@ -82,6 +82,6 @@ $env:OTEL_TRACES_EXPORTER='none'
 
 新增 tests/test_observability.py，使用 InMemorySpanExporter 验证 HTTP 树、耗时边界、旧工具接口、并发隔离、Agent 兄弟关系、gather/create_task/to_thread、W3C 传播、取消、各阶段异常、清理、脱敏、Console、初始化、关闭和模拟 Exporter 故障。
 
-P1 已完成，详见 [第二阶段文档](trace-p1.md)。P2 实现 Span→Metrics 并修正 Histogram。本阶段未修改原周期性监控统计。
+P1 已完成，详见 [第二阶段文档](trace-p1.md)。P2 已完成指标投影与 Histogram 修正，详见 [第三阶段文档](trace-p2.md)。
 
 参考：[OTel Python 导出](https://opentelemetry.io/docs/languages/python/exporters/)、[FastAPI Instrumentor](https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/fastapi/fastapi.html)。

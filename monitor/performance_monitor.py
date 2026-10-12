@@ -13,6 +13,7 @@
 """
 import asyncio
 import logging
+import os
 import statistics
 import time
 from collections import defaultdict, deque
@@ -22,7 +23,9 @@ from enum import Enum
 from typing import Any, Deque, Dict, List, Optional
 
 import httpx
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from prometheus_client import start_http_server
+from observability.bootstrap import metrics_available
+from observability.metrics_projection import get_metrics_projection, AgentMetricsSnapshot, ToolMetricsSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,8 @@ class PerformanceMonitor:
         interval_s:       float = 10.0,
         webhook_url:      Optional[str] = None,
         prometheus_port:  Optional[int] = None,   # None = 不启动
+        metrics_projection=None,
+        stats_source: Optional[str] = None,
     ):
         self._orchestrator = orchestrator
         self._tool_manager = tool_manager
@@ -138,17 +143,18 @@ class PerformanceMonitor:
         self._task:        Optional[asyncio.Task] = None
 
         # Prometheus 指标（可选）
-        self._prom: Dict[str, Any] = {}
+        self._projection = metrics_projection or get_metrics_projection()
+        self._capture_available = metrics_available
+        self._stats_source = stats_source or os.getenv("ECHOMIND_MONITOR_STATS_SOURCE", "span").lower()
+        if self._stats_source not in {"legacy", "shadow", "span"}:
+            self._stats_source = "shadow"
+        # Registered independently of the optional HTTP listener; /metrics always works.
+        self._prom = self._projection.compatibility
+        self._comparison = {}
         if prometheus_port:
             self._setup_prometheus(prometheus_port)
 
     def _setup_prometheus(self, port: int) -> None:
-        self._prom = {
-            "agent_success_rate": Gauge("agent_success_rate", "Agent 成功率", ["agent"]),
-            "agent_latency_ms":   Histogram("agent_latency_ms", "Agent 延迟", ["agent"]),
-            "tool_success_rate":  Gauge("tool_success_rate", "工具成功率", ["tool"]),
-            "requests_total":     Counter("requests_total", "总请求数"),
-        }
         start_http_server(port)
         logger.info(f"Prometheus 已启动: :{port}")
 
@@ -187,8 +193,7 @@ class PerformanceMonitor:
         关键：这里读取的 stats 就是 Orchestrator/ToolManager 在处理请求时
         实时更新的数据，Monitor 不需要额外埋点。
         """
-        agent_stats = self._orchestrator.get_stats()
-        tool_stats  = self._tool_manager.get_stats()
+        agent_stats, tool_stats = self._select_stats()
         routing_penalties: Dict[str, float] = {}
 
         # ── Agent 指标 ────────────────────────────────────────────────────────
@@ -208,8 +213,8 @@ class PerformanceMonitor:
 
             # Prometheus
             if "agent_success_rate" in self._prom:
-                self._prom["agent_success_rate"].labels(agent=agent_key).set(sr)
-                self._prom["agent_latency_ms"].labels(agent=agent_key).observe(ms)
+                self._prom["agent_success_rate"].labels(agent=self._projection.label("agent", agent_key)).set(sr)
+                self._prom["agent_avg_ms"].labels(agent=self._projection.label("agent", agent_key)).set(ms)
 
             routing_penalties[agent_key] = self._routing_penalty(sr, ms)
 
@@ -223,7 +228,7 @@ class PerformanceMonitor:
             self._check_threshold("tool_avg_ms", ms, tool_name)
 
             if "tool_success_rate" in self._prom:
-                self._prom["tool_success_rate"].labels(tool=tool_name).set(sr)
+                self._prom["tool_success_rate"].labels(tool=self._projection.label("tool", tool_name)).set(sr)
 
             # 连续失败 → 生成具体建议
             if cf >= 3:
@@ -304,11 +309,40 @@ class PerformanceMonitor:
 
     # ── 查询接口 ──────────────────────────────────────────────────────────────
 
+    def _select_stats(self):
+        """Dual-read with identical legacy success/timing definitions; fall back per row."""
+        legacy_agents = self._orchestrator.get_stats()
+        legacy_tools = self._tool_manager.get_stats()
+        projected_agents, projected_tools = self._projection.snapshots(
+            getattr(self._orchestrator, "_metrics_owner", None), getattr(self._tool_manager, "_metrics_owner", None))
+        available = self._capture_available()
+        result, comparison = [], {}
+        for component, legacy, projected, empty in (
+            ("agent", legacy_agents, projected_agents, AgentMetricsSnapshot().legacy_view()),
+            ("tool", legacy_tools, projected_tools, ToolMetricsSnapshot().legacy_view()),
+        ):
+            selected, report = {}, {}
+            for key, row in legacy.items():
+                sample = projected.get(key)
+                if sample is None and row.get("total") == 0:
+                    sample = empty
+                matches = sample is not None and all(row.get(field) == sample.get(field) for field in empty)
+                use_span = available and matches and self._stats_source == "span"
+                selected[key] = {**row, **sample} if use_span else row
+                report[key] = {"match": matches, "source": "span" if use_span else "legacy", "span": sample}
+            comparison[component] = report
+            self._projection.reconciliation.labels(component).set(sum(not r["match"] for r in report.values()))
+            result.append(selected)
+        self._comparison = {"mode": self._stats_source, "capture_available": available, **comparison}
+        return result[0], result[1]
+
     def summary(self) -> Dict[str, Any]:
         """返回当前监控摘要，供 API 层暴露。"""
+        agents, tools = self._select_stats()
         return {
-            "agent_stats":   self._orchestrator.get_stats(),
-            "tool_stats":    self._tool_manager.get_stats(),
+            "agent_stats": agents,
+            "tool_stats": tools,
+            "stats_reconciliation": self._comparison,
             "active_alerts": [asdict(a) for a in self._alerts if not a.resolved][-10:],
             "suggestions":   [
                 {"title": s.title, "action": s.action, "priority": s.priority}

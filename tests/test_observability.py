@@ -273,7 +273,9 @@ def test_disabled_sdk_and_bad_queue_config_do_not_break_business(monkeypatch):
     monkeypatch.setenv("OTEL_TRACES_EXPORTER", "console")
     monkeypatch.setenv("OTEL_BSP_MAX_QUEUE_SIZE", "0")
     with observed("invalid-config") as span:
-        assert not span.is_recording()
+        # A failed trace exporter must preserve the full local metrics channel.
+        assert span.is_recording()
+        assert bootstrap.metrics_available()
 
 
 def test_exporter_failure_in_batch_worker_does_not_break_chat(service, spans):

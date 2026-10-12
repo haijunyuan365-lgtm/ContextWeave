@@ -10,6 +10,7 @@ from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ALWAYS_OFF
 from opentelemetry.trace import NoOpTracerProvider, Status
 
 from observability.sanitization import safe_attributes
+from observability.metrics_projection import get_metrics_projection, MetricsSpanProcessor
 
 logger = logging.getLogger(__name__)
 _provider = None
@@ -37,6 +38,7 @@ class SafeSpanExporter(SpanExporter):
             result = SpanExportResult.FAILURE
         if result == SpanExportResult.FAILURE:
             self.failed_batches += 1
+            get_metrics_projection().export_errors.inc()
             logger.warning("trace_export_failed batches=%d", self.failed_batches)
         return result
 
@@ -68,6 +70,11 @@ def configure_tracing():
                 span_limits=SpanLimits(max_attributes=64, max_events=16, max_attribute_length=256),
                 shutdown_on_exit=False,
             )
+            # ALWAYS_ON feeds the local projector before the asynchronous trace export queue.
+            projection = get_metrics_projection()
+            provider.add_span_processor(MetricsSpanProcessor(projection))
+            provider.contextweave_metrics_enabled = enabled
+            projection.capture_enabled.set_function(metrics_available)
             mode = os.getenv("OTEL_TRACES_EXPORTER", "console").lower().strip()
             if enabled and mode != "none":
                 if mode == "console":
@@ -81,15 +88,18 @@ def configure_tracing():
                 provider.add_span_processor(BatchSpanProcessor(SafeSpanExporter(exporter)))
             _provider = provider
         except Exception:
-            if provider is not None:
-                provider.shutdown()
-            logger.warning("trace_setup_failed; tracing disabled")
-            _provider = NoOpTracerProvider()
+            # A broken exporter/configuration must not discard full local metrics.
+            logger.warning("trace_setup_failed; trace export disabled")
+            _provider = provider if provider is not None else NoOpTracerProvider()
         return _provider
 
 
 def get_provider():
     return configure_tracing()
+
+
+def metrics_available():
+    return getattr(get_provider(), "contextweave_metrics_enabled", False)
 
 
 def shutdown_tracing():

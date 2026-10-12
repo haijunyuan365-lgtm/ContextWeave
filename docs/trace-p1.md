@@ -74,6 +74,6 @@ $env:OTEL_TRACES_EXPORTER='none'
 
 新增 tests/test_trace_propagation.py，使用真实业务方法和离线替代服务，覆盖意图/Context/检索/Agent 并发关系、single-flight、缓存、两级 RRF 和候选数量、MMR/Rerank 回退、工具双维成功/超时/熔断、LLM Usage、所有模型调用点覆盖、直接方法调用和 Experience Link/重试/旧案例兼容。
 
-所有验证均不调用真实计费模型，也不要求 Redis、Chroma 或外部 OTLP 服务。P2 的指标投影、Histogram 修正和真实 Collector 联调尚未实施。
+所有验证均不调用真实计费模型，也不要求 Redis、Chroma 或外部 OTLP 服务。P2 已完成指标投影、Histogram 修正和本地 OTLP 接收端验证，详见 [第三阶段文档](trace-p2.md)。Collector 容器运行与真实 Langfuse 账户接入尚未验证。
 
 参考：[GenAI 语义约定 1.37.0](https://github.com/open-telemetry/semantic-conventions/blob/v1.37.0/docs/gen-ai/gen-ai-spans.md)、[OTel Python Trace API](https://opentelemetry-python.readthedocs.io/en/latest/api/trace.html)。

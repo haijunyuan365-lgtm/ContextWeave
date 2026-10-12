@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -148,6 +149,7 @@ class MCPToolManager:
             kwargs["base_url"] = base_url
         self._client = AsyncAnthropic(**kwargs)
         self._model  = model
+        self._metrics_owner = str(uuid.uuid4())
         self.rag_config = rag_config or RAGConfig.from_env()
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
@@ -188,6 +190,8 @@ class MCPToolManager:
         """
         annotate(**{"app.tool.name": name, "app.tool.layer": "mcp", "app.cache_hit": False})
         tool = self._tools.get(name)
+        annotate(**{"app.tool.monitor_owner": getattr(self, "_metrics_owner", None), "app.tool.stats_registered": tool is not None,
+                    "app.tool.stats_total": 0, "app.tool.stats_success": 0, "app.tool.stats_failed": 0, "app.tool.stats_latency_ms": 0.0})
         if not tool:
             annotate(**{"app.tool.success": False, "app.tool.result_success": False})
             outcome("error", code="TOOL_NOT_FOUND")
@@ -205,6 +209,8 @@ class MCPToolManager:
                     outcome("error", code="TOOL_BUSINESS_FAILED")
                 tool.stats.total += 1
                 tool.stats.success += 1
+                annotate(**{"app.tool.stats_total": 1, "app.tool.stats_success": 1})
+                self._observe_tool_state(tool)
                 return ToolResult(
                     success=True,
                     data=cached_data,
@@ -216,12 +222,14 @@ class MCPToolManager:
         annotate(**{"app.tool.circuit_state": tool.breaker.state.value})
         # 熔断检查
         if not tool.breaker.allow():
+            self._observe_tool_state(tool)
             annotate(**{"app.tool.circuit_open": True, "app.error_code": "CIRCUIT_OPEN"})
             error = f"工具熔断中: {name}，请稍后重试"
             return await self._fallback_result(tool, params, context, error)
 
         t0 = time.monotonic()
         tool.stats.total += 1
+        annotate(**{"app.tool.stats_total": 1})
         try:
             # 参数校验（根据 JSON Schema 的 required 和 properties.type）
             self._validate_params(tool, params)
@@ -237,6 +245,8 @@ class MCPToolManager:
             tool.stats.consecutive_fails = 0
             tool.stats.total_latency_ms += latency
             tool.breaker.record_success()
+            annotate(**{"app.tool.stats_success": 1, "app.tool.stats_latency_ms": latency})
+            self._observe_tool_state(tool)
 
             # 重排（针对返回列表的检索工具）
             reranked = False
@@ -256,6 +266,8 @@ class MCPToolManager:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
+            annotate(**{"app.tool.stats_failed": 1})
+            self._observe_tool_state(tool)
             logger.error(f"工具超时: {name} ({tool.timeout_s}s)")
             return await self._fallback_result(tool, params, context, "执行超时")
 
@@ -264,8 +276,17 @@ class MCPToolManager:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
+            annotate(**{"app.tool.stats_failed": 1})
+            self._observe_tool_state(tool)
             logger.error(f"工具异常: {name} — {ex}")
             return await self._fallback_result(tool, params, context, str(ex))
+
+    @staticmethod
+    def _observe_tool_state(tool):
+        # State changes precede potentially slow fallbacks; order by mutation, not span end.
+        annotate(**{"app.tool.stats_version": time.monotonic_ns(),
+                    "app.tool.stats_consecutive_fails": tool.stats.consecutive_fails,
+                    "app.tool.stats_circuit_state": tool.breaker.state.value})
 
     async def _fallback_result(
         self,

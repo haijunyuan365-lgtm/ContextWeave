@@ -1,0 +1,21 @@
+# Explicit opt-in overlay: docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector:0.123.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config/otel-collector.yml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4318:4318"
+    networks:
+      - echomind-network
+    restart: unless-stopped
+
+  echomind:
+    environment:
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_TIMEOUT: "3"
+    depends_on:
+      otel-collector:
+        condition: service_started
