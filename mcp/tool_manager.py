@@ -27,6 +27,10 @@ from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content
 from mcp.rag_config import RAGConfig
+from observability.llm import generate
+from observability import observed, set_outcome
+from observability.instrumentation import instrumented, annotate, outcome
+from observability.sanitization import error_code
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +172,7 @@ class MCPToolManager:
 
     # ── 核心调用 ──────────────────────────────────────────────────────────────
 
+    @instrumented("tool.execute", span_type="tool")
     async def call(
         self,
         name: str,
@@ -181,8 +186,11 @@ class MCPToolManager:
         调用工具，完整执行链：
           缓存检查 → 熔断检查 → 参数校验 → 执行（含超时）→ 可选重排 → 缓存写入
         """
+        annotate(**{"app.tool.name": name, "app.tool.layer": "mcp", "app.cache_hit": False})
         tool = self._tools.get(name)
         if not tool:
+            annotate(**{"app.tool.success": False, "app.tool.result_success": False})
+            outcome("error", code="TOOL_NOT_FOUND")
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
 
         cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
@@ -192,6 +200,9 @@ class MCPToolManager:
             cached = self._get_cache(name, params, cache_rerank_top_k)
             if cached is not None:
                 cached_data, cached_reranked = cached
+                annotate(**{"app.cache_hit": True, "app.tool.success": True, "app.tool.result_success": not isinstance(cached_data, dict) or cached_data.get("success") is not False})
+                if isinstance(cached_data, dict) and cached_data.get("success") is False:
+                    outcome("error", code="TOOL_BUSINESS_FAILED")
                 tool.stats.total += 1
                 tool.stats.success += 1
                 return ToolResult(
@@ -202,8 +213,10 @@ class MCPToolManager:
                     reranked=cached_reranked,
                 )
 
+        annotate(**{"app.tool.circuit_state": tool.breaker.state.value})
         # 熔断检查
         if not tool.breaker.allow():
+            annotate(**{"app.tool.circuit_open": True, "app.error_code": "CIRCUIT_OPEN"})
             error = f"工具熔断中: {name}，请稍后重试"
             return await self._fallback_result(tool, params, context, error)
 
@@ -215,6 +228,10 @@ class MCPToolManager:
 
             data = await asyncio.wait_for(self._run_handler(tool, params, context), timeout=tool.timeout_s)
             latency = (time.monotonic() - t0) * 1000
+            business_success = not isinstance(data, dict) or data.get("success") is not False
+            annotate(**{"app.tool.success": True, "app.tool.result_success": business_success})
+            if not business_success:
+                outcome("error", code="TOOL_BUSINESS_FAILED")
 
             tool.stats.success += 1
             tool.stats.consecutive_fails = 0
@@ -235,6 +252,7 @@ class MCPToolManager:
                               latency_ms=latency, reranked=reranked)
 
         except asyncio.TimeoutError:
+            annotate(**{"app.error_code": "TIMEOUT"})
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
@@ -242,6 +260,7 @@ class MCPToolManager:
             return await self._fallback_result(tool, params, context, "执行超时")
 
         except Exception as ex:
+            annotate(**{"app.error_code": error_code(ex)})
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
@@ -256,12 +275,18 @@ class MCPToolManager:
         error: str,
     ) -> ToolResult:
         """工具不可用时返回降级结果，而不是把空错误直接暴露给调用方。"""
+        annotate(**{"app.tool.success": False})
         if tool.fallback is None:
+            annotate(**{"app.tool.result_success": False})
+            outcome("error")
             return ToolResult(success=False, data=None, tool_name=tool.name, error=error)
         try:
             data = tool.fallback(params, context, error)
             if asyncio.iscoroutine(data):
                 data = await data
+            business_success = not isinstance(data, dict) or data.get("success") is not False
+            annotate(**{"app.tool.result_success": business_success})
+            outcome("degraded" if business_success else "error", fallback=True)
             return ToolResult(
                 success=True,
                 data=data,
@@ -269,6 +294,8 @@ class MCPToolManager:
                 error=error,
             )
         except Exception as ex:
+            annotate(**{"app.tool.result_success": False})
+            outcome("error", fallback=True, code="TOOL_FALLBACK_FAILED")
             logger.error(f"工具降级失败: {tool.name} — {ex}")
             return ToolResult(success=False, data=None, tool_name=tool.name, error=f"{error}; fallback失败: {ex}")
 
@@ -293,6 +320,7 @@ class MCPToolManager:
 
     # ── 查询改写（解决召回不全）────────────────────────────────────────────────
 
+    @instrumented("rag.rewrite", span_type="retrieval", result_count="app.rag.output_count", propagate_degradation=True)
     async def rewrite_query(self, query: str, n: int = 3) -> List[str]:
         """
         用 LLM 将原始查询改写为 n 个不同角度的子查询。
@@ -310,7 +338,7 @@ class MCPToolManager:
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
+            resp = await generate(self._client, stage="rag.rewrite",
                 model=self._model, max_tokens=256, temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -323,9 +351,11 @@ class MCPToolManager:
             # 原始查询始终排在第一位，改写数量受 n 限制。
             return list(dict.fromkeys([query.strip()] + cleaned))[:n + 1]
         except Exception as ex:
+            outcome("degraded", fallback=True, code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "REWRITE_FAILED")
             logger.warning(f"查询改写失败，使用原始查询: {ex}")
             return [query]
 
+    @instrumented("rag.pipeline", span_type="retrieval")
     async def search_with_rewrite(
         self,
         tool_name: str,
@@ -348,52 +378,69 @@ class MCPToolManager:
         started = time.monotonic()
         sub_queries = await self.rewrite_query(query, n=config.rewrite_count)
         timings["rewrite_ms"] = (time.monotonic() - started) * 1000
-        logger.info(f"查询改写: {query!r} → {sub_queries}")
+        annotate(**{"app.rag.subquery_count": len(sub_queries)})
+        logger.info("rag_rewrite subquery_count=%d", len(sub_queries))
 
         # 2. 并行召回：所有子查询同时检索
         started = time.monotonic()
         recall_k = max(top_k, config.recall_k)
-        tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
-            for q in sub_queries
-        ]
+        async def retrieve_query(index, value):
+            with observed("rag.query", span_type="retrieval", **{"app.rag.query_index": index}) as query_span:
+                result = await self.call(tool_name, {"query": value, "top_k": recall_k}, context, use_cache=True)
+                query_span.set_attribute("app.rag.output_count", len(result.data) if isinstance(result.data, list) else 0)
+                query_span.set_attribute("app.cache_hit", result.cached)
+                if not result.success:
+                    set_outcome(query_span, "error", code="RETRIEVAL_FAILED")
+                elif result.error:
+                    set_outcome(query_span, "degraded", fallback=True, code="RETRIEVAL_DEGRADED")
+                return result
+        tasks = [retrieve_query(index, value) for index, value in enumerate(sub_queries)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         timings["retrieval_ms"] = (time.monotonic() - started) * 1000
 
         # 3. 按子查询排名做第二级加权 RRF，并按稳定 chunk_id 精确去重。
         started = time.monotonic()
-        fused: Dict[str, Dict[str, Any]] = {}
-        fused_scores: Dict[str, float] = {}
-        fused_sources: Dict[str, set[str]] = {}
-        degraded = False
-        successful_lists = 0
-        for query_index, r in enumerate(results):
-            if not isinstance(r, ToolResult) or not r.success or r.error:
-                degraded = True
-            if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
-                usable = [item for item in r.data if isinstance(item, dict) and not item.get("fallback")]
-                if usable:
-                    successful_lists += 1
-                weight = 1.0 if query_index == 0 else config.rewritten_query_weight
-                for rank, item in enumerate(usable, 1):
-                    if isinstance(item, dict) and item.get("fallback"):
-                        degraded = True
-                        continue
-                    chunk_id = self._chunk_identity(item)
-                    if chunk_id not in fused:
-                        fused[chunk_id] = dict(item, chunk_id=chunk_id)
-                        fused_scores[chunk_id] = 0.0
-                        fused_sources[chunk_id] = set()
-                    fused_scores[chunk_id] += weight / (config.rrf_k + rank)
-                    fused_sources[chunk_id].update(str(s) for s in item.get("retrieval_sources", []))
+        with observed("rag.rrf.stage2", span_type="retrieval", **{"app.rag.stage": "rrf_stage2"}) as fusion_span:
+            fused: Dict[str, Dict[str, Any]] = {}
+            fused_scores: Dict[str, float] = {}
+            fused_sources: Dict[str, set[str]] = {}
+            degraded = False
+            successful_lists = 0
+            for query_index, r in enumerate(results):
+                if not isinstance(r, ToolResult) or not r.success or r.error:
+                    degraded = True
+                if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
+                    usable = [item for item in r.data if isinstance(item, dict) and not item.get("fallback")]
+                    if usable:
+                        successful_lists += 1
+                    weight = 1.0 if query_index == 0 else config.rewritten_query_weight
+                    for rank, item in enumerate(usable, 1):
+                        if isinstance(item, dict) and item.get("fallback"):
+                            degraded = True
+                            continue
+                        chunk_id = self._chunk_identity(item)
+                        if chunk_id not in fused:
+                            fused[chunk_id] = dict(item, chunk_id=chunk_id)
+                            fused_scores[chunk_id] = 0.0
+                            fused_sources[chunk_id] = set()
+                        fused_scores[chunk_id] += weight / (config.rrf_k + rank)
+                        fused_sources[chunk_id].update(str(s) for s in item.get("retrieval_sources", []))
 
-        for chunk_id, item in fused.items():
-            item["score"] = round(fused_scores[chunk_id], 8)
-            item["retrieval_sources"] = sorted(fused_sources[chunk_id])
-        merged = sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))
-        timings["rrf_ms"] = (time.monotonic() - started) * 1000
+            for chunk_id, item in fused.items():
+                item["score"] = round(fused_scores[chunk_id], 8)
+                item["retrieval_sources"] = sorted(fused_sources[chunk_id])
+            merged = sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))
+            timings["rrf_ms"] = (time.monotonic() - started) * 1000
 
+            fusion_span.set_attribute("app.rag.input_list_count", len(results))
+            fusion_span.set_attribute("app.rag.input_count", sum(len(r.data) for r in results if isinstance(r, ToolResult) and isinstance(r.data, list)))
+            fusion_span.set_attribute("app.rag.output_count", len(merged))
+        if degraded:
+            outcome("degraded", fallback=True, code="RETRIEVAL_FAILED")
+        annotate(**{"app.rag.output_count": len(merged)})
         if not merged:
+            if degraded:
+                outcome("error", code="RETRIEVAL_FAILED")
             return ToolResult(success=not degraded, data=[], tool_name=tool_name,
                               error="检索来源失败或降级" if degraded else None)
 
@@ -414,6 +461,7 @@ class MCPToolManager:
             timings["rewrite_ms"], timings["retrieval_ms"], timings["rrf_ms"],
             timings["mmr_ms"], timings["rerank_ms"], degraded,
         )
+        annotate(**{"app.rag.output_count": len(reranked)})
         return ToolResult(success=True, data=reranked, tool_name=tool_name,
                           reranked=len(diverse) > top_k,
                           error="部分检索来源失败或降级" if degraded else None)
@@ -430,14 +478,17 @@ class MCPToolManager:
         }, ensure_ascii=False, sort_keys=True)
         return "legacy:" + hashlib.sha256(stable.encode()).hexdigest()
 
+    @instrumented("rag.mmr", span_type="retrieval", result_count="app.rag.output_count", propagate_degradation=True)
     async def _mmr_select(self, tool: Optional[Tool], items: List[Dict[str, Any]],
                           limit: int, relevance_weight: float) -> List[Dict[str, Any]]:
         """Select a relevant but non-redundant pool using stored Chroma embeddings."""
+        annotate(**{"app.rag.stage": "mmr", "app.rag.input_count": len(items)})
         limit = min(limit, len(items))
         if limit <= 0:
             return []
         provider = tool.embedding_provider if tool is not None else None
         if provider is None or len(items) <= 1:
+            outcome("skipped")
             return items[:limit]
         try:
             vectors = provider([str(item["chunk_id"]) for item in items])
@@ -446,6 +497,7 @@ class MCPToolManager:
             if not isinstance(vectors, dict) or any(str(item["chunk_id"]) not in vectors for item in items):
                 raise ValueError("候选 embedding 不完整")
         except Exception as ex:
+            outcome("degraded", fallback=True, code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "MMR_EMBEDDING_FAILED")
             logger.warning("MMR embedding 获取失败，保留 RRF 排序: %s", ex)
             return items[:limit]
 
@@ -478,6 +530,7 @@ class MCPToolManager:
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
+    @instrumented("rag.rerank", span_type="retrieval", result_count="app.rag.output_count", propagate_degradation=True)
     async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
         """
         用 LLM 对召回结果重新打分排序。
@@ -485,7 +538,9 @@ class MCPToolManager:
         解决问题：向量检索的相似度分数不等于"对用户有用"，
         LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
         """
+        annotate(**{"app.rag.stage": "rerank", "app.rag.input_count": len(items), "app.rag.llm_used": len(items) > top_k})
         if len(items) <= top_k:
+            outcome("skipped")
             return items
 
         # 将结果序列化为文本供 LLM 评分
@@ -501,7 +556,7 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self._client.messages.create(
+            resp = await generate(self._client, stage="rag.rerank",
                 model=self._model, max_tokens=256, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -519,6 +574,7 @@ class MCPToolManager:
             valid.extend(index for index in range(len(items)) if index not in seen)
             return [items[index] for index in valid[:top_k]]
         except Exception as ex:
+            outcome("degraded", fallback=True, code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "RERANK_FAILED")
             logger.warning(f"重排失败，返回原始顺序: {ex}")
             return items[:top_k]
 

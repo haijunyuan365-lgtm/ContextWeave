@@ -12,6 +12,7 @@ from typing import Any
 from core.llm_utils import extract_text_content
 from memory.evolution import (ALIASES, EXPLICIT, FIELDS, MemoryDecision, MemoryResolver,
                               SourceMessage, effective_profile, empty_snapshot, now, validate_candidate)
+from observability.llm import generate
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ class CandidateExtractor:
             + json.dumps(payload, ensure_ascii=False)
         )
         client = self.client.with_options(max_retries=0) if hasattr(self.client, "with_options") else self.client
-        response = await asyncio.wait_for(client.messages.create(
+        response = await asyncio.wait_for(generate(client, stage="memory.extract",
             model=self.model, max_tokens=4000, temperature=0,
             messages=[{"role": "user", "content": prompt}],
         ), self.timeout)

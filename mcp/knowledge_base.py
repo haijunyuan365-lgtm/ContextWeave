@@ -24,6 +24,8 @@ import jieba
 from rank_bm25 import BM25Okapi
 
 from mcp.rag_config import RAGConfig
+from observability import observed
+from observability.instrumentation import instrumented, annotate, outcome
 
 logger = logging.getLogger(__name__)
 
@@ -171,8 +173,10 @@ class KnowledgeBase:
                 break
         return output
 
+    @instrumented("rag.rrf.stage1", span_type="retrieval", result_count="app.rag.output_count")
     def _rrf_fuse(self, branches: List[tuple[str, List[Dict[str, Any]]]], top_k: int) -> List[Dict[str, Any]]:
         """Fuse vector and BM25 ranks without comparing their incompatible scores."""
+        annotate(**{"app.rag.stage": "rrf_stage1", "app.rag.input_list_count": len(branches), "app.rag.input_count": sum(len(items) for _, items in branches)})
         fused: Dict[str, Dict[str, Any]] = {}
         source_sets: Dict[str, set[str]] = {}
         rrf_scores: Dict[str, float] = {}
@@ -195,26 +199,36 @@ class KnowledgeBase:
             item["retrieval_sources"] = sorted(source_sets[chunk_id])
         return sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))[:top_k]
 
+    def _search_branch(self, source: str, query: str, top_k: int):
+        with observed("rag.dense" if source == "vector" else "rag.bm25", span_type="retrieval") as span:
+            result = (self._vector_search if source == "vector" else self._bm25_search)(query, top_k)
+            span.set_attribute("app.rag.output_count", len(result))
+            return result
+
+    @instrumented("rag.hybrid", span_type="retrieval", result_count="app.rag.output_count")
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """Synchronous hybrid retrieval, retained for direct callers."""
         branches: List[tuple[str, List[Dict[str, Any]]]] = []
         errors = []
-        for source, searcher in (("vector", self._vector_search), ("bm25", self._bm25_search)):
+        for source in ("vector", "bm25"):
             try:
-                branches.append((source, searcher(query, top_k)))
+                branches.append((source, self._search_branch(source, query, top_k)))
             except Exception as ex:
                 errors.append(f"{source}: {ex}")
                 logger.warning("knowledge_%s_search_failed", source, exc_info=True)
+        if errors:
+            outcome("degraded", fallback=True, code="HYBRID_BRANCH_FAILED")
         if errors and not branches:
             raise RuntimeError("; ".join(errors))
         return self._rrf_fuse(branches, top_k)
 
+    @instrumented("rag.hybrid", span_type="retrieval", result_count="app.rag.output_count")
     async def search_async(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """Run Chroma and BM25 concurrently, degrading to either healthy branch."""
         started = time.monotonic()
         results = await asyncio.gather(
-            asyncio.to_thread(self._vector_search, query, top_k),
-            asyncio.to_thread(self._bm25_search, query, top_k),
+            asyncio.to_thread(self._search_branch, "vector", query, top_k),
+            asyncio.to_thread(self._search_branch, "bm25", query, top_k),
             return_exceptions=True,
         )
         branches: List[tuple[str, List[Dict[str, Any]]]] = []
@@ -225,6 +239,9 @@ class KnowledgeBase:
                 logger.warning("knowledge_%s_search_failed error_type=%s", source, type(result).__name__)
             else:
                 branches.append((source, result))
+        if failures:
+            annotate(**{"app.rag.failed_sources": failures})
+            outcome("degraded", fallback=True, code="HYBRID_BRANCH_FAILED")
         if failures and not branches:
             raise RuntimeError("all hybrid retrieval branches failed")
         fused = self._rrf_fuse(branches, top_k)

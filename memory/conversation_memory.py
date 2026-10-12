@@ -29,6 +29,7 @@ from core.llm_utils import extract_text_content
 from core.context_planner import LightweightContext
 from memory.evolution import SourceMessage, now
 from memory.evolution_runtime import MemoryEvolution, MemoryStore
+from observability.llm import generate
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +302,7 @@ class MemoryManager:
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
         prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
         try:
-            resp = await self._client.messages.create(
+            resp = await generate(self._client, stage="memory.compress",
                 model=self._model, max_tokens=256, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -516,7 +517,7 @@ class MemoryManager:
 """
         )
         try:
-            resp = await self._client.messages.create(
+            resp = await generate(self._client, stage="memory.merge_summary",
                 model=self._model,
                 max_tokens=256,
                 temperature=0.0,

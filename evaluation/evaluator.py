@@ -29,6 +29,7 @@ from anthropic import AsyncAnthropic
 from core.llm_utils import extract_text_content
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
+from observability.llm import generate
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,7 @@ Agent 响应: {response}
         )
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
+            resp = await generate(self._client, stage="evaluation.judge",
                 model=self._model, max_tokens=256, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )

@@ -16,6 +16,11 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from observability import observed, request_context, correlation_ids
+from observability.context import detached_task, detached_context, source_link
+from observability.instrumentation import annotate, outcome
+from observability.sanitization import error_code
+from observability.sanitization import hash_identifier
 
 logger = logging.getLogger(__name__)
 STATES = {"pending", "active", "rejected", "failed", "revoked"}
@@ -82,6 +87,8 @@ class ExperienceCase:
     status: str = "pending"
     reason: str = ""
     attempts: int = 0
+    source_trace_id: str = ""
+    source_span_id: str = ""
     created_at: str = field(default_factory=now)
     updated_at: str = field(default_factory=now)
 
@@ -194,7 +201,7 @@ class ExperienceManager:
     async def start(self) -> None:
         if self.enabled and self._worker is None:
             self._stopping = False
-            self._worker = asyncio.create_task(self._run())
+            self._worker = detached_task(self._run())
 
     async def close(self) -> None:
         if self._worker is not None:
@@ -207,14 +214,21 @@ class ExperienceManager:
             self._worker = None
 
     async def submit(self, req: Any, result: Any) -> str | None:
+        with request_context(req.request_id), observed("experience.submit", span_type="experience", reuse=True):
+            return await self._submit(req, result)
+
+    async def _submit(self, req: Any, result: Any) -> str | None:
         if not self.enabled or not eligible_user(req.user_id):
+            outcome("skipped")
             return None
         try:
             case = self.snapshot(req, result)
             await asyncio.wait_for(self.store.insert(case), self.io_timeout)
             self._wake.set()
+            annotate(**{"app.experience.case_hash": hash_identifier(case["case_id"]), "app.experience.status": case["status"]})
             return case["case_id"]
         except Exception:
+            outcome("degraded", code="EXPERIENCE_SUBMIT_FAILED")
             logger.warning("experience_submit_failed request_id=%s", req.request_id)
             return None
 
@@ -243,48 +257,65 @@ class ExperienceManager:
             query=sanitize(req.message), intent=intent, entities=sanitize(req.entities),
             agents=list(dict.fromkeys(e.get("agent_type") for e in execution if e.get("agent_type"))),
             tools=sanitize(tools), knowledge=sanitize(knowledge), response=sanitize(result.response),
+            source_trace_id=correlation_ids()["trace_id"], source_span_id=correlation_ids()["span_id"],
             execution=sanitize(execution), status="rejected" if reason else "pending", reason=reason)
         return asdict(case)
 
     async def process(self, user_id: str, case_id: str) -> None:
+        # Independent trace, including storage failures, even when called from a request.
+        with detached_context(), observed("experience.process", span_type="experience", **{
+                "app.operation": "experience", "app.experience.case_hash": hash_identifier(case_id)}) as span:
+            await self._process(user_id, case_id, span)
+
+    async def _process(self, user_id: str, case_id: str, span) -> None:
         async with self._lock:
             case = await self.store.read(user_id, case_id)
+            if case:
+                annotate(**{"app.request_id": case.get("request_id", "")})
+                for link in source_link(case.get("source_trace_id", ""), case.get("source_span_id", "")):
+                    span.add_link(link.context, link.attributes)
             if not case or case["status"] != "pending":
+                outcome("skipped")
                 await self.store.acknowledge(case_id)
                 return
             if case["attempts"] >= 3:
+                outcome("error", code="EXPERIENCE_RETRY_EXHAUSTED")
                 case.update(status="failed", reason="retry_exhausted")
                 await self.store.write(case)
                 await self.store.acknowledge(case_id)
                 return
             case["attempts"] += 1
+            annotate(**{"app.experience.attempt": case["attempts"]})
             await self.store.write(case)
-        try:
-            evidence = json.dumps({"tools": case["tools"], "knowledge": case["knowledge"]}, ensure_ascii=False)
-            scores = await asyncio.wait_for(self.judge.judge(case["query"], case["response"], evidence), self.timeout)
-            values = {name: getattr(scores, name, None) for name in SCORE_NAMES}
-            if getattr(scores, "judge_failed", False) or any(
-                type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in values.values()
-            ):
-                raise ValueError("invalid judge scores")
-            accepted = sum(values.values()) / 4 >= self.threshold and values["accuracy"] >= self.accuracy
-            if accepted:
-                await asyncio.wait_for(self.index.upsert(case), self.timeout)
-            async with self._lock:
-                latest = await self.store.read(user_id, case_id)
-                if latest and latest["status"] == "pending":
-                    latest.update(judge_score=values, status="active" if accepted else "rejected",
-                                  reason="judge_passed" if accepted else "low_score")
-                    await self.store.write(latest)
-        except Exception:
-            async with self._lock:
-                latest = await self.store.read(user_id, case_id)
-                if latest and latest["status"] == "pending":
-                    latest.update(status="failed" if latest["attempts"] >= 3 else "pending", reason="processing_failed")
-                    await self.store.write(latest)
-        latest = await self.store.read(user_id, case_id)
-        if latest and latest["status"] != "pending":
-            await self.store.acknowledge(case_id)
+        with request_context(case.get("request_id", "")):
+            try:
+                evidence = json.dumps({"tools": case["tools"], "knowledge": case["knowledge"]}, ensure_ascii=False)
+                scores = await asyncio.wait_for(self.judge.judge(case["query"], case["response"], evidence), self.timeout)
+                values = {name: getattr(scores, name, None) for name in SCORE_NAMES}
+                if getattr(scores, "judge_failed", False) or any(
+                    type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in values.values()
+                ):
+                    raise ValueError("invalid judge scores")
+                accepted = sum(values.values()) / 4 >= self.threshold and values["accuracy"] >= self.accuracy
+                annotate(**{"app.experience.accepted": accepted})
+                if accepted:
+                    await asyncio.wait_for(self.index.upsert(case), self.timeout)
+                async with self._lock:
+                    latest = await self.store.read(user_id, case_id)
+                    if latest and latest["status"] == "pending":
+                        latest.update(judge_score=values, status="active" if accepted else "rejected",
+                                      reason="judge_passed" if accepted else "low_score")
+                        await self.store.write(latest)
+            except Exception as exc:
+                outcome("error", code="TIMEOUT" if error_code(exc) == "TIMEOUT" else "EXPERIENCE_PROCESSING_FAILED")
+                async with self._lock:
+                    latest = await self.store.read(user_id, case_id)
+                    if latest and latest["status"] == "pending":
+                        latest.update(status="failed" if latest["attempts"] >= 3 else "pending", reason="processing_failed")
+                        await self.store.write(latest)
+            latest = await self.store.read(user_id, case_id)
+            if latest and latest["status"] != "pending":
+                await self.store.acknowledge(case_id)
 
     async def _run(self) -> None:
         while not self._stopping:

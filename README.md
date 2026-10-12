@@ -20,6 +20,7 @@ EchoMind 是一个面向客服/运营场景的多 Agent 智能系统。它不是
 - [业务流程说明](wiki/业务流程说明.md)
 - [完整使用指南](wiki/完整使用指南.md)
 - [Trace 第一阶段：配置、Span 树与验证](docs/trace-p0.md)
+- [Trace 第二阶段：并发、RAG、工具、模型与后台关联](docs/trace-p1.md)
 
 ## 快速开始
 

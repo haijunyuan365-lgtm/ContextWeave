@@ -1,9 +1,13 @@
 """Request-local business identity alongside the current OTel context."""
 from contextlib import contextmanager
 from contextvars import ContextVar
+import contextvars
+import asyncio
 
 from opentelemetry import trace
 from opentelemetry.propagate import inject, extract
+from opentelemetry.context import Context, attach, detach
+from opentelemetry.trace import SpanContext, TraceFlags, Link
 
 _request_id = ContextVar("contextweave_request_id", default="")
 
@@ -33,3 +37,28 @@ def inject_headers(headers: dict[str, str]) -> None:
 
 def extract_headers(headers: dict[str, str]):
     return extract(headers)
+
+
+def detached_task(coroutine):
+    """Python 3.10-compatible task creation without the initiating request's context."""
+    return contextvars.Context().run(asyncio.create_task, coroutine)
+
+
+@contextmanager
+def detached_context():
+    token = attach(Context())
+    try:
+        with request_context(""):
+            yield
+    finally:
+        detach(token)
+
+
+def source_link(trace_id: str, span_id: str, flags: int = 1):
+    try:
+        if len(trace_id) != 32 or len(span_id) != 16:
+            return ()
+        context = SpanContext(int(trace_id, 16), int(span_id, 16), True, TraceFlags(flags))
+        return (Link(context),) if context.is_valid else ()
+    except (ValueError, TypeError):
+        return ()

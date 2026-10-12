@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.llm_utils import extract_text_content
+from observability.llm import generate
+from observability.instrumentation import outcome
+from observability.sanitization import error_code
 
 SOURCES = ("memory", "profile", "knowledge", "skill", "experience")
 
@@ -132,7 +135,7 @@ class ContextPlanner:
         try:
             # Disable SDK retries: one planner attempt with a bounded wall-clock timeout.
             client = self.client.with_options(max_retries=0) if hasattr(self.client, "with_options") else self.client
-            response = await asyncio.wait_for(client.messages.create(
+            response = await asyncio.wait_for(generate(client, stage="context.plan",
                 model=self.model, max_tokens=600, temperature=0,
                 messages=[{"role": "user", "content": prompt}],
             ), self.timeout)
@@ -159,6 +162,7 @@ class ContextPlanner:
             if not self.experience_enabled:
                 data["reasons"]["experience"] = "未配置 Experience 来源"
             return ContextPlan(**data, planner_source="llm")
-        except Exception:
+        except Exception as exc:
+            outcome("degraded", fallback=True, code="TIMEOUT" if error_code(exc) == "TIMEOUT" else "PLANNER_FAILED")
             base.planner_source = "fallback"
             return base

@@ -82,6 +82,6 @@ $env:OTEL_TRACES_EXPORTER='none'
 
 新增 tests/test_observability.py，使用 InMemorySpanExporter 验证 HTTP 树、耗时边界、旧工具接口、并发隔离、Agent 兄弟关系、gather/create_task/to_thread、W3C 传播、取消、各阶段异常、清理、脱敏、Console、初始化、关闭和模拟 Exporter 故障。
 
-P1 补意图分支、Context 各来源、Dense/BM25、RRF/MMR/Rerank、Tool、全部 LLM Usage 和 Experience Worker 新 Trace + Link。P2 实现 Span→Metrics 并修正 Histogram。本阶段未修改原周期性监控统计。
+P1 已完成，详见 [第二阶段文档](trace-p1.md)。P2 实现 Span→Metrics 并修正 Histogram。本阶段未修改原周期性监控统计。
 
 参考：[OTel Python 导出](https://opentelemetry.io/docs/languages/python/exporters/)、[FastAPI Instrumentor](https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/fastapi/fastapi.html)。

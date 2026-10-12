@@ -11,6 +11,8 @@ from typing import Any
 
 from core.context_planner import ContextPlan, LightweightContext, SOURCES
 from observability import observed, traced, set_outcome
+from observability.instrumentation import instrumented, annotate, outcome
+from observability.sanitization import error_code
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,7 @@ class RetrievalResult:
     reranked: bool = False
     cached: bool = False
     error: str = ""
+    error_code: str = ""
 
 
 @dataclass
@@ -77,7 +80,9 @@ class RetrievalSession:
         self._pending: dict[tuple, asyncio.Task] = {}
         self.knowledge_used = False
 
+    @instrumented("context.source.retrieve", span_type="retrieval")
     async def retrieve(self, source: str, query: str = "", top_k: int | None = None) -> RetrievalResult:
+        annotate(**{"app.context.source": source})
         if source not in {"memory", "profile", "knowledge", "experience"}:
             raise ValueError("unsupported retrieval source")
         if top_k is None:
@@ -97,6 +102,7 @@ class RetrievalSession:
         stat["calls"] += 1
         started = time.monotonic()
         hit = key in self._cache or key in self._pending
+        annotate(**{"app.cache_hit": hit})
         try:
             if key in self._cache:
                 result = self._cache[key]
@@ -116,8 +122,8 @@ class RetrievalSession:
                 try:
                     result.data = await self.experience.revalidate(self.user_id, result.data)
                     result.status = "success" if result.data else "empty"
-                except Exception:
-                    result = RetrievalResult("failed", error="经验状态核验失败")
+                except Exception as exc:
+                    result = RetrievalResult("failed", error="经验状态核验失败", error_code=error_code(exc))
             result.cached = hit
             stat.update(status=result.status, count=len(result.data) if isinstance(result.data, (list, dict)) else 0)
             if hit:
@@ -130,6 +136,13 @@ class RetrievalSession:
                 for item in result.data or []:
                     if item not in self.knowledge_evidence:
                         self.knowledge_evidence.append(copy.deepcopy(item))
+            annotate(**{"app.context.status": result.status, "app.context.output_count": stat["count"]})
+            if result.status == "failed":
+                outcome("error", code=result.error_code or "CONTEXT_SOURCE_FAILED")
+            elif result.status == "degraded":
+                outcome("degraded", fallback=True, code="CONTEXT_SOURCE_DEGRADED")
+            elif result.status == "unconfigured":
+                outcome("skipped")
             return result
         finally:
             stat["latency_ms"] = round(stat["latency_ms"] + (time.monotonic() - started) * 1000, 2)
@@ -163,9 +176,9 @@ class RetrievalSession:
                 if not isinstance(data, dict):
                     return RetrievalResult("failed", error="用户画像格式无效")
             return RetrievalResult("success" if data else "empty", data)
-        except Exception:
+        except Exception as exc:
             # Provider errors may contain private query text; do not echo them into debug output.
-            return RetrievalResult("failed", error="上下文来源读取失败")
+            return RetrievalResult("failed", error="上下文来源读取失败", error_code=error_code(exc))
 
     def mark_knowledge_delivered(self, data: list[Any]) -> None:
         if data:
@@ -277,7 +290,10 @@ class ContextPipeline:
                 set_outcome(span, "skipped")
             else:
                 try:
-                    await self.experience.submit(req, result)
+                    case_id = await self.experience.submit(req, result)
+                    span.set_attribute("app.experience.submitted", case_id is not None)
+                    if case_id is None and getattr(span, "attributes", {}).get("app.outcome", "success") == "success":
+                        set_outcome(span, "skipped")
                 except Exception:
                     set_outcome(span, "degraded", code="EXPERIENCE_SUBMIT_FAILED")
                     logger.warning("experience_capture_failed request_id=%s", req.request_id)

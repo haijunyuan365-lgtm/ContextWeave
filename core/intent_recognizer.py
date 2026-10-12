@@ -22,6 +22,9 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content
+from observability.instrumentation import instrumented, annotate, outcome
+from observability.sanitization import error_code
+from observability.llm import generate
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +172,7 @@ class IntentRecognizer:
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
+    @instrumented("intent.recognize", span_type="intent", reuse=True)
     async def recognize(
         self,
         message: str,
@@ -183,8 +187,11 @@ class IntentRecognizer:
         key = self._cache_key(message, history, summary)
         if key in self._cache:
             self.cache_hits += 1
+            annotate(**{"app.cache_hit": True})
+            annotate(**{"app.intent.name": self._cache[key].intent.value, "app.intent.confidence": self._cache[key].confidence})
             return self._cache[key]
         self.cache_misses += 1
+        annotate(**{"app.cache_hit": False})
 
         t0 = time.monotonic()
 
@@ -200,6 +207,10 @@ class IntentRecognizer:
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
         intent, confidence, source_scores = self._vote(llm, emb, pat)
+        annotate(**{"app.intent.name": intent.value, "app.intent.confidence": confidence})
+        if llm.get("failed") or emb.get("failed"):
+            outcome("degraded", fallback=True, code="INTENT_BRANCH_FAILED")
+        annotate(**{"app.intent.source." + name: score for name, score in source_scores.items()})
         entities = self._extract_entities(message)
         urgency  = self._urgency(message, intent)
 
@@ -232,6 +243,7 @@ class IntentRecognizer:
 
     # ── 三路识别策略 ──────────────────────────────────────────────────────────
 
+    @instrumented("intent.llm", span_type="intent", propagate_degradation=True)
     async def _llm_recognize(
         self,
         message: str,
@@ -268,7 +280,7 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self.client.messages.create(
+            resp = await generate(self.client, stage="intent",
                 model=self.model,
                 max_tokens=256,
                 temperature=0.1,
@@ -281,11 +293,14 @@ class IntentRecognizer:
                 data["intent"] = IntentCategory(data["intent"])
             except ValueError:
                 data["intent"] = IntentCategory.OTHER
+            annotate(**{"app.intent.name": data["intent"].value, "app.intent.confidence": data.get("confidence", 0.0)})
             return data
         except Exception as ex:
+            outcome("degraded", fallback=True, code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "INTENT_LLM_FAILED")
             logger.warning(f"LLM 识别失败: {ex}")
             return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
 
+    @instrumented("intent.embedding", span_type="intent", propagate_degradation=True)
     async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
         """策略 2：Embedding 向量相似度匹配。"""
         try:
@@ -298,11 +313,14 @@ class IntentRecognizer:
                 if score > best_score:
                     best_score, best_cat = score, cat
 
+            annotate(**{"app.intent.name": best_cat.value, "app.intent.confidence": best_score})
             return {"intent": best_cat, "confidence": best_score}
         except Exception as ex:
+            outcome("degraded", fallback=True, code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "INTENT_EMBEDDING_FAILED")
             logger.warning(f"Embedding 识别失败: {ex}")
-            return {"intent": IntentCategory.OTHER, "confidence": 0.0}
+            return {"intent": IntentCategory.OTHER, "confidence": 0.0, "failed": True}
 
+    @instrumented("intent.pattern", span_type="intent")
     def _pattern_recognize(self, message: str) -> Dict[str, Any]:
         """策略 3：关键词模式匹配（同步，零延迟兜底）。"""
         msg = message.lower()
@@ -329,10 +347,12 @@ class IntentRecognizer:
         }
 
         best_cat, best_score = self._best_pattern_match(msg, specific_patterns)
+        annotate(**{"app.intent.name": best_cat.value, "app.intent.confidence": best_score})
         if best_cat != IntentCategory.OTHER:
             return {"intent": best_cat, "confidence": best_score}
 
         best_cat, best_score = self._best_pattern_match(msg, generic_patterns)
+        annotate(**{"app.intent.name": best_cat.value, "app.intent.confidence": best_score})
         return {"intent": best_cat, "confidence": best_score}
 
     # ── 投票合并 ──────────────────────────────────────────────────────────────
@@ -413,11 +433,13 @@ class IntentRecognizer:
         Embedding 服务缺失导致三路融合中断。
         """
         embeddings = getattr(self.client, "embeddings", None)
+        annotate(**{"app.embedding.mode": "remote" if embeddings is not None else "local"})
         if embeddings is not None:
             try:
                 resp = await embeddings.create(model="voyage-3-lite", input=[text])
                 return list(resp.data[0].embedding)
             except Exception as ex:
+                outcome("degraded", fallback=True, code="REMOTE_EMBEDDING_FAILED")
                 logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
 
         return self._local_embedding(text)

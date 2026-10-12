@@ -16,7 +16,7 @@ def hash_identifier(value: str) -> str:
 def error_code(exc: BaseException) -> str:
     if isinstance(exc, asyncio.CancelledError):
         return "CANCELLED"
-    if isinstance(exc, TimeoutError):
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
         return "TIMEOUT"
     return "EXECUTION_ERROR"
 
@@ -24,7 +24,7 @@ def error_code(exc: BaseException) -> str:
 def safe_attributes(attributes) -> dict:
     result = {}
     for key, value in (attributes or {}).items():
-        if any(part in key.lower() for part in _PRIVATE_KEYS):
+        if key not in {"app.rag.query_index", "app.rag.subquery_count"} and any(part in key.lower() for part in _PRIVATE_KEYS):
             continue
         if value is None:
             continue

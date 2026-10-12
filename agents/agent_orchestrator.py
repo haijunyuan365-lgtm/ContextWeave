@@ -43,7 +43,10 @@ from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLeve
 from core.llm_utils import extract_text_content
 from core.context_planner import ContextPlan
 from core.context_runtime import ContextBundle, RetrievalSession
-from observability import observed, request_context, set_outcome
+from observability.llm import generate
+from observability.instrumentation import annotate, outcome
+from observability.sanitization import error_code
+from observability import observed, request_context, set_outcome, traced
 
 logger = logging.getLogger(__name__)
 
@@ -209,9 +212,11 @@ class BaseAgent:
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
 
+    @traced("agent.execute", span_type="agent", reuse=True)
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
+        annotate(**{"app.agent.name": self.agent_type.value, "app.agent.role": self.profile.role})
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
         try:
@@ -220,6 +225,7 @@ class BaseAgent:
             self.stats.success += 1
             self.stats.total_ms += ms
             escalate = self._needs_escalation(content)
+            annotate(**{"app.agent.success": True, "app.agent.escalated": escalate})
             return AgentResponse(
                 agent_type=self.agent_type,
                 content=content,
@@ -232,6 +238,8 @@ class BaseAgent:
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
             self.stats.total_ms += ms
+            annotate(**{"app.agent.success": False})
+            outcome("error", code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "AGENT_FAILED")
             logger.error(f"{self.agent_type.value} 处理失败: {ex}")
             return AgentResponse(
                 agent_type=self.agent_type,
@@ -264,7 +272,7 @@ class BaseAgent:
         tools = self.get_tools()
         tools_used = tools_used if tools_used is not None else []
         tool_traces = tool_traces if tool_traces is not None else []
-        for _ in range(3):
+        for round_number in range(1, 4):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
                 "max_tokens": self.profile.max_tokens,
@@ -281,7 +289,7 @@ class BaseAgent:
                     }
                     for spec in tools.values()
                 ]
-            resp = await self._client.messages.create(**request_kwargs)
+            resp = await generate(self._client, stage="agent", round_number=round_number, **request_kwargs)
             if req.retrieval_session is not None and req.context_bundle is not None:
                 req.retrieval_session.mark_knowledge_delivered(req.context_bundle.knowledge)
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
@@ -299,24 +307,37 @@ class BaseAgent:
                 call_success = True
                 result_success: Optional[bool] = None
                 error_text = ""
-                if spec is None:
-                    call_success = False
-                    result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
-                    error_text = result["error"]
-                else:
-                    try:
-                        self._validate_tool_input(spec, args)
-                        result = spec.handler(req, args)
-                        if inspect.isawaitable(result):
-                            result = await result
-                        tools_used.append(name)
-                        if isinstance(result, dict) and "success" in result:
-                            result_success = bool(result.get("success"))
-                    except Exception as ex:
+                tool_error_code = ""
+                with observed("tool.execute", span_type="tool", **{"app.agent.name": self.agent_type.value, "app.tool.name": name, "app.tool.layer": "agent"}) as tool_span:
+                    if spec is None:
                         call_success = False
-                        logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
-                        error_text = str(ex)
-                        result = {"success": False, "error": error_text}
+                        tool_error_code = "TOOL_NOT_ALLOWED"
+                        result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
+                        error_text = result["error"]
+                    else:
+                        try:
+                            self._validate_tool_input(spec, args)
+                            result = spec.handler(req, args)
+                            if inspect.isawaitable(result):
+                                result = await result
+                            tools_used.append(name)
+                            if isinstance(result, dict) and "success" in result:
+                                result_success = bool(result.get("success"))
+                        except Exception as ex:
+                            call_success = False
+                            tool_error_code = error_code(ex)
+                            logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
+                            error_text = str(ex)
+                            result = {"success": False, "error": error_text}
+                    tool_span.set_attribute("app.tool.success", call_success)
+                    if isinstance(result, dict) and "success" in result:
+                        tool_span.set_attribute("app.tool.result_success", bool(result["success"]))
+                    tool_span.set_attribute("app.tool.reranked", bool(result.get("reranked")) if isinstance(result, dict) else False)
+                    tool_span.set_attribute("app.cache_hit", bool(result.get("cached")) if isinstance(result, dict) else False)
+                    if not call_success or result_success is False:
+                        set_outcome(tool_span, "error", code=tool_error_code or "TOOL_BUSINESS_FAILED")
+                    elif isinstance(result, dict) and (result.get("error") or result.get("fallback")):
+                        set_outcome(tool_span, "degraded", fallback=True, code="TOOL_FALLBACK")
                 tool_latency_ms = (time.monotonic() - tool_t0) * 1000
                 if not error_text and isinstance(result, dict):
                     error_text = str(result.get("error", "") or "")
@@ -554,9 +575,12 @@ class EscalationAgent(BaseAgent):
         tools.update(escalation_tools())
         return tools
 
+    @traced("agent.execute", span_type="agent", reuse=True)
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
+        annotate(**{"app.agent.name": self.agent_type.value, "app.agent.role": self.profile.role})
+        annotate(**{"app.agent.success": True, "app.agent.escalated": True})
         intent = req.intent.value if req.intent else "unknown"
         urgency = req.urgency.name if req.urgency else "UNKNOWN"
         entities = json.dumps(req.entities or {}, ensure_ascii=False)
@@ -587,9 +611,11 @@ class ResponseComposer:
         self._model = model
         self._skill_manager = skill_manager
 
+    @traced("agent.compose", span_type="agent", reuse=True)
     async def compose(self, req: Request, responses: List[AgentResponse]) -> str:
         successful = [response for response in responses if response.success and response.content.strip()]
         if not successful:
+            outcome("error", code="NO_AGENT_RESPONSE")
             return "抱歉，所有 Agent 均处理失败。"
         if len(successful) == 1:
             return successful[0].content
@@ -613,7 +639,7 @@ class ResponseComposer:
             if skill:
                 prompt += f"\n\n[通用客服输出边界]\n{skill}"
         try:
-            response = await self._client.messages.create(
+            response = await generate(self._client, stage="agent.compose",
                 model=self._model,
                 max_tokens=_env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 1000),
                 temperature=_env_float("ECHOMIND_COMPOSER_TEMPERATURE", 0.1),
@@ -626,6 +652,7 @@ class ResponseComposer:
             logger.warning("Response Composer 失败，使用确定性合并: %s", ex)
 
         # 汇总节点不可用时保留主次标签，避免丢失某个专业 Agent 的结论。
+        outcome("degraded", fallback=True, code="COMPOSER_FALLBACK")
         req.execution_records.append({"agent_type": "composer", "success": False, "fallback": True})
         return "\n\n".join(
             f"{response.content}" if index == 0 else f"补充说明：\n{response.content}"
@@ -844,6 +871,18 @@ class AgentOrchestrator:
         return result
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
+        with request_context(req.request_id), observed("agent.orchestrate", span_type="agent", reuse=True) as span:
+            result = await self._run_parallel(req, decision)
+            span.set_attribute("app.agent.multi_agent", True)
+            span.set_attribute("app.agent.name", result.agent_type.value)
+            span.set_attribute("app.agent.escalated", result.escalated)
+            if req.execution_records and not any(r["success"] for r in req.execution_records):
+                set_outcome(span, "error", code="AGENT_FAILED")
+            elif any(not r["success"] or r["fallback"] for r in req.execution_records):
+                set_outcome(span, "degraded", fallback=any(r["fallback"] for r in req.execution_records))
+            return result
+
+    async def _run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
         """
         并行派发给多个 Agent，合并结果。
         适用于复杂问题（如同时涉及技术和账单）。
@@ -1105,9 +1144,16 @@ class AgentOrchestrator:
         return max(agents, key=lambda a: a.stats.routing_score())
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
-        with observed("agent.execute", span_type="agent", **{"app.agent.name": agent_type.value}) as span:
-            response = await self._execute_agent(req, agent_type)
-            fallback = response.agent_type != agent_type
+        return await self._execute_agent(req, agent_type)
+
+    async def _handle_agent(self, req: Request, agent: BaseAgent, requested: AgentType,
+                            fallback: bool = False) -> AgentResponse:
+        with observed("agent.execute", span_type="agent", **{
+                "app.agent.name": agent.agent_type.value, "app.agent.role": agent.profile.role,
+                "app.agent.requested_name": requested.value}) as span:
+            response = await agent.handle(req)
+            span.set_attribute("app.agent.success", response.success)
+            span.set_attribute("app.agent.escalated", response.escalate)
             if not response.success:
                 set_outcome(span, "error", fallback=fallback, code="AGENT_FAILED")
             elif fallback:
@@ -1127,7 +1173,7 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req)
+        response = await self._handle_agent(req, agent, agent_type, agent.agent_type != agent_type)
         req.execution_records.append({"agent_type": response.agent_type.value, "success": response.success,
                                       "fallback": response.agent_type != agent_type})
 
@@ -1136,7 +1182,7 @@ class AgentOrchestrator:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                response = await fallback.handle(req)
+                response = await self._handle_agent(req, fallback, agent_type, True)
                 req.execution_records.append({"agent_type": response.agent_type.value,
                                               "success": response.success, "fallback": True})
 
