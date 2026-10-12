@@ -11,6 +11,7 @@ from opentelemetry.trace import NoOpTracerProvider, Status
 
 from observability.sanitization import safe_attributes
 from observability.metrics_projection import get_metrics_projection, MetricsSpanProcessor
+from observability.policy import TracePolicy, SamplingExporter
 
 logger = logging.getLogger(__name__)
 _provider = None
@@ -75,6 +76,20 @@ def configure_tracing():
             provider.add_span_processor(MetricsSpanProcessor(projection))
             provider.contextweave_metrics_enabled = enabled
             projection.capture_enabled.set_function(metrics_available)
+            try:
+                policy = TracePolicy.load()
+            except Exception:
+                policy = TracePolicy(export_ratio=0)
+                logger.warning("trace_policy_invalid; detailed export disabled")
+            projection.prices = policy.prices
+            if enabled and policy.history_enabled:
+                try:
+                    from observability import history
+                    store = history.TraceHistory(policy)
+                    provider.add_span_processor(BatchSpanProcessor(SafeSpanExporter(SamplingExporter(store, policy.export_ratio))))
+                    history._history = store
+                except Exception:
+                    logger.warning("trace_history_setup_failed")
             mode = os.getenv("OTEL_TRACES_EXPORTER", "console").lower().strip()
             if enabled and mode != "none":
                 if mode == "console":
@@ -85,7 +100,7 @@ def configure_tracing():
                     exporter = OTLPSpanExporter()
                 else:
                     raise ValueError("unsupported trace exporter")
-                provider.add_span_processor(BatchSpanProcessor(SafeSpanExporter(exporter)))
+                provider.add_span_processor(BatchSpanProcessor(SafeSpanExporter(SamplingExporter(exporter, policy.export_ratio))))
             _provider = provider
         except Exception:
             # A broken exporter/configuration must not discard full local metrics.

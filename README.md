@@ -22,6 +22,7 @@ EchoMind 是一个面向客服/运营场景的多 Agent 智能系统。它不是
 - [Trace 第一阶段：配置、Span 树与验证](docs/trace-p0.md)
 - [Trace 第二阶段：并发、RAG、工具、模型与后台关联](docs/trace-p1.md)
 - [Trace 第三阶段：指标投影、监控对账与 OTLP 验证](docs/trace-p2.md)
+- [Trace 第四阶段：历史查询、质量回归、采样与告警看板](docs/trace-p3.md)
 
 ## 快速开始
 

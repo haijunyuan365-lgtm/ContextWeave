@@ -30,6 +30,9 @@ from core.llm_utils import extract_text_content
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
 from observability.llm import generate
+from observability import observed, request_context, correlation_ids
+from observability.context import detached_context, source_link
+from observability.evaluation import record_scores
 
 logger = logging.getLogger(__name__)
 
@@ -350,16 +353,22 @@ class EndToEndEvaluator:
                 context=context,
                 history=history[-6:] if history else None,
             )
-            orch_result = await self._orchestrator.run(orch_req)
-            actual_answer = orch_result.response
-
-            scores = await self._judge.judge(question, actual_answer, context=context or None)
-            passed = scores.overall >= self.PASS_THRESHOLD
+            test_id = f"dialog_{case_idx}" if len(questions) == 1 else f"dialog_{case_idx}_turn_{turn_idx}"
+            with detached_context(), request_context(orch_req.request_id), observed(
+                "evaluation.dialog", span_type="evaluation",
+                links=source_link(case.get("source_trace_id", ""), case.get("source_span_id", "")),
+                **{"app.operation": "evaluation", "app.eval.test_id": test_id},
+            ):
+                ids = correlation_ids()
+                orch_result = await self._orchestrator.run(orch_req)
+                actual_answer = orch_result.response
+                scores = await self._judge.judge(question, actual_answer, context=context or None)
+                passed = scores.overall >= self.PASS_THRESHOLD and not scores.judge_failed
+                record_scores(scores, test_id=test_id, passed=passed)
 
             history.append({"role": "user", "content": question})
             history.append({"role": "assistant", "content": actual_answer})
 
-            test_id = f"dialog_{case_idx}" if len(questions) == 1 else f"dialog_{case_idx}_turn_{turn_idx}"
             results.append(EvalResult(
                 test_id=test_id,
                 passed=passed,
@@ -372,6 +381,9 @@ class EndToEndEvaluator:
                 },
                 detail=f"Q: {question[:30]}... → 综合评分 {scores.overall:.3f}",
                 metadata={
+                    "trace_id": ids["trace_id"],
+                    "request_id": orch_req.request_id,
+                    "source_trace_id": case.get("source_trace_id", ""),
                     "question": question,
                     "response": actual_answer,
                     "agent_type": orch_result.agent_type.value,

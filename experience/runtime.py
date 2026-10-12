@@ -20,6 +20,7 @@ from observability import observed, request_context, correlation_ids
 from observability.context import detached_task, detached_context, source_link
 from observability.instrumentation import annotate, outcome
 from observability.sanitization import error_code
+from observability.evaluation import record_scores
 from observability.sanitization import hash_identifier
 
 logger = logging.getLogger(__name__)
@@ -298,6 +299,8 @@ class ExperienceManager:
                     raise ValueError("invalid judge scores")
                 accepted = sum(values.values()) / 4 >= self.threshold and values["accuracy"] >= self.accuracy
                 annotate(**{"app.experience.accepted": accepted})
+                record_scores(scores, test_id="experience", passed=accepted,
+                              source_trace_id=case.get("source_trace_id", ""))
                 if accepted:
                     await asyncio.wait_for(self.index.upsert(case), self.timeout)
                 async with self._lock:

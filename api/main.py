@@ -30,6 +30,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from observability import observed, request_context, correlation_ids, set_outcome
 from observability.bootstrap import configure_tracing, configure_logging, shutdown_tracing
 from observability.sanitization import hash_identifier
+from observability.api import build_router
 
 load_dotenv()
 
@@ -493,6 +494,9 @@ async def list_recent_tool_traces(limit: int = 20):
 async def prometheus_metrics():
     """Prometheus 指标入口。"""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+app.include_router(build_router(lambda: _evaluator))
 
 
 @app.post("/search")

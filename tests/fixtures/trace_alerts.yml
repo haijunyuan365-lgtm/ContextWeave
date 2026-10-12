@@ -1,0 +1,75 @@
+rule_files:
+  - ../../config/alerts/trace.yml
+evaluation_interval: 1m
+tests:
+  - name: sustained-high-latency-degradation-export-and-disabled-capture
+    interval: 1m
+    input_series:
+      - series: contextweave_request_duration_ms_bucket{le="10000"}
+        values: 0+0x10
+      - series: contextweave_request_duration_ms_bucket{le="30000"}
+        values: 0+36x10
+      - series: contextweave_request_duration_ms_bucket{le="+Inf"}
+        values: 0+36x10
+      - series: contextweave_requests_total{outcome="success"}
+        values: 0+30x10
+      - series: contextweave_requests_total{outcome="degraded"}
+        values: 0+6x10
+      - series: contextweave_trace_export_failures_total
+        values: 0+1x10
+      - series: contextweave_metrics_capture_enabled
+        values: 0+0x10
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ContextWeaveRequestP95High
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: 对话处理 P95 持续超过 10 秒}
+      - eval_time: 10m
+        alertname: ContextWeaveDegradationHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: 对话错误及降级率持续超过 10%}
+      - eval_time: 10m
+        alertname: ContextWeaveTraceExportFailure
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: Trace 后台导出失败（含本地历史写入）}
+      - eval_time: 10m
+        alertname: ContextWeaveMetricsCaptureDisabled
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations: {summary: 全量 Span 指标采集已关闭}
+  - name: low-traffic-does-not-trigger-latency-or-degradation
+    interval: 1m
+    input_series:
+      - series: contextweave_request_duration_ms_bucket{le="10000"}
+        values: 0+0x10
+      - series: contextweave_request_duration_ms_bucket{le="30000"}
+        values: 0+2x10
+      - series: contextweave_request_duration_ms_bucket{le="+Inf"}
+        values: 0+2x10
+      - series: contextweave_requests_total{outcome="success"}
+        values: 0+1x10
+      - series: contextweave_requests_total{outcome="degraded"}
+        values: 0+1x10
+      - series: contextweave_trace_export_failures_total
+        values: 0+0x10
+      - series: contextweave_metrics_capture_enabled
+        values: 1+0x10
+    alert_rule_test:
+      - {eval_time: 10m, alertname: ContextWeaveRequestP95High, exp_alerts: []}
+      - {eval_time: 10m, alertname: ContextWeaveDegradationHigh, exp_alerts: []}
+      - {eval_time: 10m, alertname: ContextWeaveTraceExportFailure, exp_alerts: []}
+      - {eval_time: 10m, alertname: ContextWeaveMetricsCaptureDisabled, exp_alerts: []}
+  - name: app-unavailable
+    interval: 1m
+    input_series:
+      - series: up{job="echomind-app",instance="echomind:8000"}
+        values: 0+0x3
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ContextWeaveAppUnavailable
+        exp_alerts:
+          - exp_labels: {severity: critical, job: echomind-app, instance: 'echomind:8000'}
+            exp_annotations: {summary: 应用指标端点不可用}

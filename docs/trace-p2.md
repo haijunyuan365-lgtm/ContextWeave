@@ -134,6 +134,6 @@ $env:OTEL_TRACES_EXPORTER='none'
 .\.venv-win\Scripts\python.exe -m pytest tests -q
 ```
 
-后续 P3 才增加历史查询、受控候选快照、评测关联、告警/成本看板、详细 Trace 采样和保留策略。
+P3 已实现本地历史查询、受控候选快照、评测关联、告警/成本看板及详细 Trace 采样和保留策略，详见 [第四阶段文档](trace-p3.md)。
 
 参考：[OTel Collector 配置](https://opentelemetry.io/docs/collector/configuration/)、[Prometheus Python Histogram](https://prometheus.github.io/client_python/instrumenting/histogram/)、[Langfuse 原生 OTel 接入](https://langfuse.com/integrations/native/opentelemetry)。

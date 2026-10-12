@@ -9,6 +9,7 @@ import threading
 from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.trace import StatusCode
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
+from observability.policy import estimate_cost
 
 logger = logging.getLogger(__name__)
 LATENCY_BUCKETS_MS = (1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000)
@@ -53,6 +54,9 @@ class MetricsProjection:
         self._agents = OrderedDict()
         self._tools = OrderedDict()
         self.failures = 0
+        self.prices = {}
+        self.cost = Counter("contextweave_llm_estimated_cost", "Configured estimate; never a billing statement", ["provider", "model", "stage", "currency", "price_version"], registry=registry)
+        self.cost_known = Counter("contextweave_llm_cost_known", "Calls with complete usage and configured prices", ["provider", "model", "stage"], registry=registry)
         self.capture_enabled = Gauge("contextweave_metrics_capture_enabled", "1 when full local Span capture is available", registry=registry)
         self.capture_enabled.set(1)
         self.compatibility = {
@@ -186,6 +190,11 @@ class MetricsProjection:
                 stage = self.label("stage", attrs.get("app.llm.stage", "unknown"))
                 self.llm_calls.labels(provider, model, stage, outcome).inc()
                 self.llm_duration.labels(provider, model, stage).observe(duration)
+                cost = estimate_cost(attrs, self.prices)
+                if cost is not None:
+                    amount, currency, version = cost
+                    self.cost.labels(provider, model, stage, self.label("currency", currency), self.label("price_version", version)).inc(amount)
+                    self.cost_known.labels(provider, model, stage).inc()
                 fields = {"input": "gen_ai.usage.input_tokens", "output": "gen_ai.usage.output_tokens",
                           "cache_read": "app.llm.cache_read_tokens", "cache_write": "app.llm.cache_write_tokens"}
                 for kind, key in fields.items():

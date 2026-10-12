@@ -31,6 +31,7 @@ from mcp.rag_config import RAGConfig
 from observability.llm import generate
 from observability import observed, set_outcome
 from observability.instrumentation import instrumented, annotate, outcome
+from observability.rag_snapshot import candidates, ranked
 from observability.sanitization import error_code
 
 logger = logging.getLogger(__name__)
@@ -432,6 +433,7 @@ class MCPToolManager:
                     degraded = True
                 if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                     usable = [item for item in r.data if isinstance(item, dict) and not item.get("fallback")]
+                    candidates(usable, "input", source=f"subquery_{query_index}")
                     if usable:
                         successful_lists += 1
                     weight = 1.0 if query_index == 0 else config.rewritten_query_weight
@@ -451,6 +453,7 @@ class MCPToolManager:
                 item["score"] = round(fused_scores[chunk_id], 8)
                 item["retrieval_sources"] = sorted(fused_sources[chunk_id])
             merged = sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))
+            candidates(merged)
             timings["rrf_ms"] = (time.monotonic() - started) * 1000
 
             fusion_span.set_attribute("app.rag.input_list_count", len(results))
@@ -500,6 +503,7 @@ class MCPToolManager:
         return "legacy:" + hashlib.sha256(stable.encode()).hexdigest()
 
     @instrumented("rag.mmr", span_type="retrieval", result_count="app.rag.output_count", propagate_degradation=True)
+    @ranked
     async def _mmr_select(self, tool: Optional[Tool], items: List[Dict[str, Any]],
                           limit: int, relevance_weight: float) -> List[Dict[str, Any]]:
         """Select a relevant but non-redundant pool using stored Chroma embeddings."""
@@ -552,6 +556,7 @@ class MCPToolManager:
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
     @instrumented("rag.rerank", span_type="retrieval", result_count="app.rag.output_count", propagate_degradation=True)
+    @ranked
     async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
         """
         用 LLM 对召回结果重新打分排序。

@@ -1,0 +1,38 @@
+groups:
+  - name: contextweave-trace
+    rules:
+      - alert: ContextWeaveRequestP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(contextweave_request_duration_ms_bucket[5m]))) > 10000 and sum(increase(contextweave_requests_total[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 对话处理 P95 持续超过 10 秒
+      - alert: ContextWeaveDegradationHigh
+        expr: sum(rate(contextweave_requests_total{outcome=~"error|degraded"}[5m])) / clamp_min(sum(rate(contextweave_requests_total[5m])), 0.001) > 0.1 and sum(increase(contextweave_requests_total[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 对话错误及降级率持续超过 10%
+      - alert: ContextWeaveTraceExportFailure
+        expr: increase(contextweave_trace_export_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Trace 后台导出失败（含本地历史写入）
+      - alert: ContextWeaveMetricsCaptureDisabled
+        expr: contextweave_metrics_capture_enabled == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 全量 Span 指标采集已关闭
+      - alert: ContextWeaveAppUnavailable
+        expr: up{job="echomind-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 应用指标端点不可用

@@ -56,6 +56,7 @@ services:
       - '--web.enable-lifecycle'
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/alerts:/etc/prometheus/alerts:ro
       - prometheus-data:/prometheus
     restart: unless-stopped
     networks:
@@ -87,6 +88,8 @@ services:
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
+      - observability-data:/app/data/observability
+      - ./config/observability.yml:/app/config/observability.yml:ro
       - ./skills:/app/skills
       - ./logs:/app/logs
     depends_on:
@@ -139,4 +142,5 @@ volumes:
   redis-data:
   chromadb-data:
   prometheus-data:
+  observability-data:
   nginx-logs:

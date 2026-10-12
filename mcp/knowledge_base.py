@@ -26,6 +26,7 @@ from rank_bm25 import BM25Okapi
 from mcp.rag_config import RAGConfig
 from observability import observed
 from observability.instrumentation import instrumented, annotate, outcome
+from observability.rag_snapshot import candidates
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +182,7 @@ class KnowledgeBase:
         source_sets: Dict[str, set[str]] = {}
         rrf_scores: Dict[str, float] = {}
         for source, items in branches:
+            candidates(items, "input", source=source)
             for rank, item in enumerate(items, 1):
                 chunk_id = str(item["chunk_id"])
                 if chunk_id not in fused:
@@ -197,12 +199,13 @@ class KnowledgeBase:
         for chunk_id, item in fused.items():
             item["score"] = round(rrf_scores[chunk_id], 8)
             item["retrieval_sources"] = sorted(source_sets[chunk_id])
-        return sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))[:top_k]
+        return candidates(sorted(fused.values(), key=lambda item: (-float(item["score"]), str(item["chunk_id"])))[:top_k])
 
     def _search_branch(self, source: str, query: str, top_k: int):
         with observed("rag.dense" if source == "vector" else "rag.bm25", span_type="retrieval") as span:
             result = (self._vector_search if source == "vector" else self._bm25_search)(query, top_k)
             span.set_attribute("app.rag.output_count", len(result))
+            candidates(result)
             return result
 
     @instrumented("rag.hybrid", span_type="retrieval", result_count="app.rag.output_count")

@@ -56,8 +56,8 @@ COPY --from=dependencies --chown=echomind:echomind /root/.cache/chroma /home/ech
 COPY --chown=echomind:echomind . .
 
 # 创建必要目录，只调整运行期需要写入的目录权限，避免递归 chown 整个应用。
-RUN mkdir -p /app/data/chroma /app/logs /app/config && \
-    chown echomind:echomind /app/data /app/data/chroma /app/logs /app/config
+RUN mkdir -p /app/data/chroma /app/data/observability /app/logs /app/config && \
+    chown echomind:echomind /app/data /app/data/chroma /app/data/observability /app/logs /app/config
 USER echomind
 
 EXPOSE 8000
