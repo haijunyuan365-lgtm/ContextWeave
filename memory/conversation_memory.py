@@ -13,7 +13,10 @@
   - 用户消息独立排队，LLM 提取候选，确定性 Resolver 维护版本和来源
 """
 import hashlib
+import os
 import asyncio
+from contextlib import asynccontextmanager
+from core.concurrency import KeyedLocks, redis_lease
 import json
 import logging
 import uuid
@@ -23,6 +26,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import redis.asyncio as redis
+from redis.exceptions import WatchError
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content
@@ -57,6 +61,8 @@ class MemoryContext:
     relevant_history: List[str]       # 情景记忆：语义相关的历史片段
     user_profile:     Dict[str, Any]  # 用户画像：偏好、常用实体
     summary:          str             # 当前会话摘要（压缩后）
+
+    state: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -138,6 +144,7 @@ class MemoryManager:
         self._memory_store = MemoryStore(chroma.get_or_create_collection("user_memory", embedding_function=None))
         self._evolution = MemoryEvolution(self._redis, self._memory_store, self._client, self._model)
         self._conversation_locks: Dict[tuple, asyncio.Lock] = {}
+        self._request_locks = KeyedLocks()
 
     async def create_experience(self):
         """Optional experience backend sharing existing Redis/Chroma connections."""
@@ -155,6 +162,100 @@ class MemoryManager:
         except Exception:
             logger.warning("Experience backend unavailable; continuing without experience")
             return None
+
+    @classmethod
+    def _conversation_id(cls, user_id: str, conv_id: str) -> str:
+        return hashlib.sha256(json.dumps([cls._safe_text(user_id), cls._safe_text(conv_id)], ensure_ascii=True).encode()).hexdigest()
+
+    @classmethod
+    def _state_key(cls, user_id: str, conv_id: str) -> str:
+        return f"state_v1:{cls._conversation_id(user_id, conv_id)}"
+
+    async def _migrate_legacy_keys(self, user_id: str, conv_id: str) -> None:
+        # 带冒号的旧键无法确定原始归属，保留原数据但禁止自动读取/迁移。
+        user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
+        if ":" in user_id or ":" in conv_id:
+            return
+        # RENAMENX 原子迁移并保留 TTL；已有新数据时不覆盖。
+        script = """
+        if redis.call('EXISTS', KEYS[1]) == 1 and redis.call('EXISTS', KEYS[2]) == 0 then
+            return redis.call('RENAMENX', KEYS[1], KEYS[2])
+        end
+        return 0
+        """
+        for old, new in [(f"wm:{user_id}:{conv_id}", self._wm_key(user_id, conv_id)),
+                         (f"summary:{user_id}:{conv_id}", self._summary_key(user_id, conv_id))]:
+            await self._redis.eval(script, 2, old, new)
+
+    @asynccontextmanager
+    async def conversation(self, user_id: str, conv_id: str):
+        # 哈希避免 user_id/conv_id 中的分隔符引起锁键碰撞。
+        digest = hashlib.sha256(json.dumps([self._safe_text(user_id), self._safe_text(conv_id)]).encode()).hexdigest()
+        async with self._request_locks.hold(digest):
+            async with redis_lease(self._redis, f"lock:conversation:{digest}"):
+                await self._migrate_legacy_keys(user_id, conv_id)
+                yield
+
+    def receipt_key(self, user_id, conv_id, request_id):
+        return "turn_receipt:" + self._conversation_id(user_id, conv_id) + ":" + hashlib.sha256(request_id.encode()).hexdigest()
+
+    async def get_turn_receipt(self, user_id, conv_id, request_id):
+        raw = await self._redis.get(self.receipt_key(user_id, conv_id, request_id))
+        return json.loads(raw) if raw else None
+
+    async def finalize_receipt(self, user_id, conv_id, request_id, message, response):
+        # Caller still owns the conversation lease. The atomic receipt already exists;
+        # only response timing is finalized here, so interrupted finalization is replayable.
+        await self._redis.setex(self.receipt_key(user_id, conv_id, request_id), 86400,
+            json.dumps({"message": message, "response": response}))
+
+    async def get_trace(self, request_id):
+        raw = await self._redis.get("trace:" + request_id)
+        return json.loads(raw) if raw else None
+
+    async def recent_traces(self, limit):
+        keys = await self._redis.lrange("trace:recent", 0, max(1, min(limit, 200))-1)
+        if not keys:
+            return []
+        rows = await self._redis.mget(["trace:" + key for key in keys])
+        return [json.loads(row) for row in rows if row]
+
+    async def commit_turn(self, user_id, conv_id, request_id, message, response, trace=None, *, state=None, source=None):
+        """Commit messages, evidence, state and receipt in one Redis transaction."""
+        await self._migrate_legacy_keys(user_id, conv_id)
+        successful = response.get("status", "success") != "failed"
+        if successful:
+            source = source or await self.begin_turn(user_id, conv_id, message)
+            if (source.user_id, source.conv_id, source.content, source.role) != (user_id, conv_id, message, "user"):
+                raise ValueError("source scope mismatch")
+        def raw(role, content):
+            return json.dumps({"role": role, "content": self._safe_text(content),
+                "ts": source.timestamp, "metadata": {"request_id": request_id},
+                "message_id": source.message_id if role == "user" else source.message_id + ":assistant",
+                "sequence": source.sequence}, ensure_ascii=False)
+        pipe = self._redis.pipeline(transaction=True)
+        if successful:
+            key = self._wm_key(user_id, conv_id)
+            pipe.lpush(key, raw("user", message), raw("assistant", response["response"]))
+            pipe.expire(key, 86400)
+            if state is not None:
+                pipe.setex(self._state_key(user_id, conv_id), 86400, json.dumps(state))
+            if getattr(self, "_evolution", None) is not None:
+                self._evolution.enqueue_commands(pipe, source)
+        pipe.setex(self.receipt_key(user_id, conv_id, request_id), 86400,
+                   json.dumps({"message": message, "response": response}))
+        if trace:
+            from core.redaction import redact
+            pipe.setex("trace:" + response["request_id"], 7 * 86400, json.dumps(redact(trace)))
+            pipe.lpush("trace:recent", response["request_id"])
+            pipe.ltrim("trace:recent", 0, 199)
+        await pipe.execute()
+        if successful and getattr(self, "_evolution", None) is not None:
+            self._evolution.schedule(user_id)
+
+    async def maintain(self, user_id, conv_id):
+        await asyncio.wait_for(self._compress(user_id, conv_id), 30)
+        await self.update_profile(user_id, conv_id)
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
@@ -189,6 +290,7 @@ class MemoryManager:
             msg.message_id = source.message_id if role == MsgRole.USER else source.message_id + ":" + role.value
             if role == MsgRole.USER:
                 msg.timestamp = datetime.fromisoformat(source.timestamp)
+        await self._migrate_legacy_keys(user_id, conv_id)
         key = self._wm_key(user_id, conv_id)
         async with self._conversation_lock(user_id, conv_id):
             pipe = self._redis.pipeline(transaction=True)
@@ -257,10 +359,12 @@ class MemoryManager:
             relevant_history=history,
             user_profile=profile,
             summary=summary,
+            state=json.loads(await self._redis.get(self._state_key(user_id, conv_id)) or "{}"),
         )
 
     async def get_lightweight_context(self, user_id: str, conv_id: str) -> LightweightContext:
         user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
+        await self._migrate_legacy_keys(user_id, conv_id)
         recent, summary = await asyncio.gather(
             self._get_working_memory(user_id, conv_id, limit=5),
             self._redis.get(self._summary_key(user_id, conv_id)),
@@ -268,6 +372,7 @@ class MemoryManager:
         return LightweightContext(
             recent_history=[{"role": m.role.value, "content": m.content} for m in recent],
             summary=self._safe_text(summary or "")[:800],
+            state=json.loads(await self._redis.get(self._state_key(user_id, conv_id)) or "{}"),
         )
 
     async def search_episodic(self, user_id: str, conv_id: str, query: str, top_k: int = 5) -> List[str]:
@@ -281,8 +386,73 @@ class MemoryManager:
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
     async def _compress(self, user_id: str, conv_id: str) -> None:
+        """
+        工作记忆压缩：
+          1. 用 LLM 对旧消息生成摘要
+          2. 摘要存 Redis（覆盖旧摘要）
+          3. 旧消息存入情景记忆（ChromaDB）供跨会话检索
+          4. 工作记忆只保留最近 5 条
+        """
+        key = self._wm_key(user_id, conv_id)
+        skey = self._summary_key(user_id, conv_id)
+        # 必须读取完整快照，不能只压缩最近 WORKING_MAX 条后删除整段列表。
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.lrange(key, 0, -1)
+            pipe.get(skey)
+            snapshot, old_summary = await pipe.execute()
+        if len(snapshot) < self.COMPRESS_AT:
+            return
+        old_summary = old_summary or ""
+        messages = []
+        for raw in reversed(snapshot):
+            d = json.loads(raw)
+            messages.append(Message(role=MsgRole(d["role"]), content=d["content"],
+                timestamp=datetime.fromisoformat(d["ts"]), metadata=d.get("metadata", {}),
+                message_id=d.get("message_id") or "legacy:" + hashlib.sha256((key + raw).encode()).hexdigest(),
+                sequence=d.get("sequence", 0)))
+        to_compress = messages[:-5]
+        text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
+        prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
+        try:
+            resp = await generate(self._client, stage="memory.compress",
+                model=self._model, max_tokens=1024, temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            summary = self._safe_text(extract_text_content(resp.content)).strip()
+            if not summary or getattr(resp, "stop_reason", None) == "max_tokens":
+                logger.warning("摘要为空或被截断，保留原始会话消息")
+                return
+        except Exception as ex:
+            logger.warning("摘要生成失败，保留原始会话消息: %s", type(ex).__name__)
+            return
+
+        new_summary = await self._merge_summary(old_summary, summary)
+        # WATCH/MULTI 同时保护列表和摘要；并发新增的消息保留在列表头部。
         async with self._conversation_lock(user_id, conv_id):
-            await self._compress_locked(user_id, conv_id)
+            for _ in range(3):
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    try:
+                        await pipe.watch(key, skey)
+                        current = await pipe.lrange(key, 0, -1)
+                        current_summary = await pipe.get(skey) or ""
+                        if len(current) < len(snapshot) or current[-len(snapshot):] != snapshot or current_summary != old_summary:
+                            return  # 其他压缩任务已更新快照，不再覆盖它。
+                        keep_count = len(current) - len(snapshot) + 5
+                        # Archive before trimming; stable source IDs make retries idempotent.
+                        if not await self._store_episodic(user_id, conv_id, text, summary,
+                                source_ids=[m.message_id for m in to_compress]):
+                            return
+                        pipe.multi()
+                        pipe.setex(skey, 86400, new_summary)
+                        pipe.ltrim(key, 0, keep_count - 1)
+                        pipe.expire(key, 86400)
+                        await pipe.execute()
+                        logger.info("工作记忆压缩完成: %s/%s", user_id, conv_id)
+                        return
+                    except WatchError:
+                        continue
+            logger.info("会话持续并发写入，本次压缩延期")
+
 
     async def _compress_locked(self, user_id: str, conv_id: str) -> None:
         """
@@ -332,6 +502,7 @@ class MemoryManager:
     # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
     async def _get_working_memory(self, user_id: str, conv_id: str, limit: Optional[int] = None) -> List[Message]:
+        await self._migrate_legacy_keys(user_id, conv_id)
         key  = self._wm_key(user_id, conv_id)
         end = -1 if limit == 0 else (limit or self.WORKING_MAX) - 1
         raws = await self._redis.lrange(key, 0, end)
@@ -431,13 +602,13 @@ class MemoryManager:
         await self._client.close()
         await self._redis.aclose()
 
-    @staticmethod
-    def _wm_key(user_id: str, conv_id: str) -> str:
-        return f"wm:{user_id}:{conv_id}"
+    @classmethod
+    def _wm_key(cls, user_id: str, conv_id: str) -> str:
+        return f"wm_v2:{cls._conversation_id(user_id, conv_id)}"
 
-    @staticmethod
-    def _summary_key(user_id: str, conv_id: str) -> str:
-        return f"summary:{user_id}:{conv_id}"
+    @classmethod
+    def _summary_key(cls, user_id: str, conv_id: str) -> str:
+        return f"summary_v2:{cls._conversation_id(user_id, conv_id)}"
 
     @classmethod
     def _profile_doc_id(cls, user_id: str) -> str:

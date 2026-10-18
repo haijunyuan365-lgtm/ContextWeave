@@ -1,3 +1,4 @@
+from memory_fakes import atomic_http_stub
 import asyncio
 import io
 import logging
@@ -59,7 +60,7 @@ def service(monkeypatch):
         begin_turn=AsyncMock(side_effect=begin), add_message=AsyncMock(side_effect=persist))
     pipeline = ContextPipeline(orch, ContextPlanner(None, "test"), mem)
     monkeypatch.setattr(main, "_orchestrator", orch)
-    monkeypatch.setattr(main, "_memory", mem)
+    monkeypatch.setattr(main, "_memory", atomic_http_stub(mem))
     monkeypatch.setattr(main, "_context_pipeline", pipeline)
     return orch, mem, pipeline
 

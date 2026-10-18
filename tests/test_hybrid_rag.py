@@ -24,9 +24,24 @@ class FakeCollection:
         self.documents.extend(documents)
         self.metadatas.extend(metadatas)
 
-    def get(self, ids=None, include=None):
+    def upsert(self, ids, documents, metadatas):
+        for i, doc, meta in zip(ids, documents, metadatas):
+            if i in self.ids:
+                pos = self.ids.index(i)
+                self.documents[pos], self.metadatas[pos] = doc, meta
+            else:
+                self.add([i], [doc], [meta])
+
+    def delete(self, ids):
+        for i in ids:
+            if i in self.ids:
+                pos = self.ids.index(i)
+                for array in [self.ids, self.documents, self.metadatas]:
+                    array.pop(pos)
+
+    def get(self, ids=None, include=None, where=None):
         selected = range(len(self.ids)) if ids is None else [self.ids.index(item) for item in ids]
-        indexes = list(selected)
+        indexes = [i for i in selected if not where or all(self.metadatas[i].get(k) == v for k,v in where.items())]
         result = {"ids": [self.ids[index] for index in indexes]}
         if include and "documents" in include:
             result["documents"] = [self.documents[index] for index in indexes]
@@ -41,6 +56,7 @@ def bare_knowledge_base() -> KnowledgeBase:
     kb = object.__new__(KnowledgeBase)
     kb.rag_config = RAGConfig()
     kb._bm25_lock = threading.RLock()
+    kb._write_lock = threading.RLock()
     kb._bm25 = None
     kb._bm25_items = ()
     kb._collection = FakeCollection()
@@ -131,7 +147,7 @@ def test_rerank_validates_duplicates_and_fills_missing_indexes():
     manager = object.__new__(MCPToolManager)
     manager._model = "test"
     manager._client = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(
-        return_value=SimpleNamespace(content=[SimpleNamespace(type="text", text="[2, 2, 99]")]))))
+        return_value=SimpleNamespace(content=[SimpleNamespace(type="text", text="[2, 2]")]))))
     candidates = [item("a", "A"), item("b", "B"), item("c", "C"), item("d", "D")]
     result = asyncio.run(manager._rerank("query", candidates, 3))
     assert [entry["chunk_id"] for entry in result] == ["c", "a", "b"]

@@ -98,7 +98,7 @@ def test_archive_failures_do_not_discard_messages_older_than_working_max():
         added = []
         for i in range(25):
             added.append(await mem.add_message("u", "c", MsgRole.USER, f"message-{i}"))
-        assert await redis.llen("wm:u:c") == 25
+        assert await redis.llen(mem._wm_key("u", "c")) == 25
         mem._episodic.fail_write = False
         await mem._compress("u", "c")
         stored = mem._episodic.writes[0][2]["metadatas"][0]

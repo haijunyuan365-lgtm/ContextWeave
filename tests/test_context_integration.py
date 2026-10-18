@@ -1,3 +1,4 @@
+from memory_fakes import atomic_http_stub
 import asyncio
 import json
 from types import SimpleNamespace
@@ -18,13 +19,13 @@ from tooling.tool_manager import MCPToolManager, ToolResult
 def test_lightweight_memory_reads_only_five_messages_and_summary():
     mem = object.__new__(MemoryManager)
     records = [json.dumps({"role": "user", "content": str(i), "ts": "2026-09-16T12:00:00"}) for i in range(5)]
-    mem._redis = SimpleNamespace(lrange=AsyncMock(return_value=records), get=AsyncMock(return_value="摘" * 1000))
+    mem._redis = SimpleNamespace(lrange=AsyncMock(return_value=records), get=AsyncMock(side_effect=lambda key: "{}" if key.startswith("state_") else "摘" * 1000), eval=AsyncMock(return_value=0))
     mem._episodic = Mock()
     mem._profile = Mock()
     light = asyncio.run(mem.get_lightweight_context("u", "c"))
     assert [m["content"] for m in light.recent_history] == ["4", "3", "2", "1", "0"]
     assert len(light.summary) == 800
-    mem._redis.lrange.assert_awaited_once_with("wm:u:c", 0, 4)
+    mem._redis.lrange.assert_awaited_once_with(mem._wm_key("u", "c"), 0, 4)
     assert not mem._episodic.mock_calls and not mem._profile.mock_calls
 
 
@@ -86,7 +87,7 @@ def test_chat_default_compatibility_and_opt_in_debug(monkeypatch, mode, expected
     rag = SimpleNamespace(search_with_rewrite=AsyncMock(return_value=ToolResult(mode != "error", docs, "knowledge_search")))
     pipeline = ContextPipeline(orch, ContextPlanner(None, "test"), mem, rag)
     monkeypatch.setattr(main, "_orchestrator", orch)
-    monkeypatch.setattr(main, "_memory", mem)
+    monkeypatch.setattr(main, "_memory", atomic_http_stub(mem))
     monkeypatch.setattr(main, "_context_pipeline", pipeline)
     client = TestClient(main.app)
     for debug in (False, True):
@@ -124,7 +125,7 @@ def test_chat_reports_reactive_knowledge_even_without_preloading(monkeypatch):
         True, [{"title": "退款", "content": "参考政策"}], "knowledge_search")))
     planner = SimpleNamespace(plan=AsyncMock(return_value=ContextPlan(need_skill=False)))
     monkeypatch.setattr(main, "_orchestrator", orch)
-    monkeypatch.setattr(main, "_memory", mem)
+    monkeypatch.setattr(main, "_memory", atomic_http_stub(mem))
     monkeypatch.setattr(main, "_context_pipeline", ContextPipeline(orch, planner, mem, rag))
     body = TestClient(main.app).post("/chat", json={"message": "退款政策", "debug_context": True}).json()
     assert body["knowledge_used"] is True

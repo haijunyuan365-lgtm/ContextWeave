@@ -13,6 +13,7 @@
   5. 降级策略（Fallback）—— 工具不可用时返回有意义的降级结果。
 """
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -89,6 +90,7 @@ class CircuitBreaker:
         self.threshold   = failure_threshold
         self.recovery_s  = recovery_s
         self.state       = CircuitState.CLOSED
+        self.generation = 0
         self.fail_count  = 0
         self.opened_at:  Optional[float] = None
 
@@ -97,18 +99,24 @@ class CircuitBreaker:
             return True
         if self.state == CircuitState.OPEN:
             if time.monotonic() - self.opened_at >= self.recovery_s:  # type: ignore
+                self.generation += 1
                 self.state = CircuitState.HALF_OPEN
                 return True
             return False
-        return True  # HALF_OPEN：放行一次探测
+        return False  # 唯一探测尚未结束，其他请求走降级
 
-    def record_success(self) -> None:
+    def record_success(self, generation=None) -> None:
+        if generation is not None and generation != self.generation:
+            return
         self.fail_count = 0
         self.state = CircuitState.CLOSED
 
-    def record_failure(self) -> None:
+    def record_failure(self, generation=None) -> None:
+        if generation is not None and generation != self.generation:
+            return
         self.fail_count += 1
-        if self.fail_count >= self.threshold:
+        if self.state == CircuitState.HALF_OPEN or self.fail_count >= self.threshold:
+            self.generation += 1
             self.state     = CircuitState.OPEN
             self.opened_at = time.monotonic()
             logger.warning(f"熔断器打开（连续失败 {self.fail_count} 次）")
@@ -153,35 +161,37 @@ class MCPToolManager:
         self._metrics_owner = str(uuid.uuid4())
         self.rag_config = rag_config or RAGConfig.from_env()
         self._tools: Dict[str, Tool] = {}
+        self._cache_versions: Dict[str, int] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
 
     def fork(self):
-        """Share dependencies while isolating evaluation cache, breakers and metrics."""
+        """共享只读依赖和 HTTP 客户端，隔离工具统计、熔断和缓存。"""
         other = object.__new__(type(self))
         other._client, other._model = self._client, self._model
+        other._cache, other._cache_versions = {}, {}
         other.rag_config = self.rag_config
         other._metrics_owner = uuid.uuid4().hex
-        other._cache = {}
         other._tools = {name: replace(tool) for name, tool in self._tools.items()}
         return other
-
-    def invalidate_cache(self, name=None):
-        self.clear_cache(name)
 
     # ── 注册 / 注销 ───────────────────────────────────────────────────────────
 
     def register(self, tool: Tool) -> None:
+        self.invalidate_cache(tool.name)
         self._tools[tool.name] = tool
         logger.info(f"注册工具: {tool.name}")
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+        self.invalidate_cache(name)
 
     def clear_cache(self, name: Optional[str] = None) -> None:
         """Invalidate cached tool output after a backing data source changes."""
         if name is None:
-            self._cache.clear()
+            for tool_name in self._tools:
+                self.invalidate_cache(tool_name)
             return
+        self.invalidate_cache(name)
         prefix = name + ":"
         for key in [key for key in self._cache if key.startswith(prefix)]:
             del self._cache[key]
@@ -211,11 +221,17 @@ class MCPToolManager:
             outcome("error", code="TOOL_NOT_FOUND")
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
 
+        try:
+            self._validate_params(tool, params)
+        except ValueError as ex:
+            # 用户参数错误不应使健康的外部服务被熔断。
+            return ToolResult(success=False, data=None, tool_name=name, error=str(ex))
+        cache_version = self._cache_versions.get(name, 0)
         cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
 
         # 缓存命中
         if use_cache and tool.cache_ttl > 0:
-            cached = self._get_cache(name, params, cache_rerank_top_k)
+            cached = self._get_cache(name, params, cache_rerank_top_k, context)
             if cached is not None:
                 cached_data, cached_reranked = cached
                 annotate(**{"app.cache_hit": True, "app.tool.success": True, "app.tool.result_success": not isinstance(cached_data, dict) or cached_data.get("success") is not False})
@@ -241,13 +257,11 @@ class MCPToolManager:
             error = f"工具熔断中: {name}，请稍后重试"
             return await self._fallback_result(tool, params, context, error)
 
+        generation = tool.breaker.generation
         t0 = time.monotonic()
         tool.stats.total += 1
         annotate(**{"app.tool.stats_total": 1})
         try:
-            # 参数校验（根据 JSON Schema 的 required 和 properties.type）
-            self._validate_params(tool, params)
-
             data = await asyncio.wait_for(self._run_handler(tool, params, context), timeout=tool.timeout_s)
             latency = (time.monotonic() - t0) * 1000
             business_success = not isinstance(data, dict) or data.get("success") is not False
@@ -255,31 +269,36 @@ class MCPToolManager:
             if not business_success:
                 outcome("error", code="TOOL_BUSINESS_FAILED")
 
-            tool.stats.success += 1
-            tool.stats.consecutive_fails = 0
-            tool.stats.total_latency_ms += latency
-            tool.breaker.record_success()
-            annotate(**{"app.tool.stats_success": 1, "app.tool.stats_latency_ms": latency})
-            self._observe_tool_state(tool)
-
             # 重排（针对返回列表的检索工具）
             reranked = False
             if rerank_top_k > 0 and tool.supports_rerank and isinstance(data, list):
                 query = params.get("query", "")
-                data, reranked = await self._rerank(query, data, rerank_top_k), True
+                data, reranked = await self._rerank_with_status(query, data, rerank_top_k)
+
+            latency = (time.monotonic() - t0) * 1000
+            tool.stats.success += 1
+            tool.stats.consecutive_fails = 0
+            tool.stats.total_latency_ms += latency
+            tool.breaker.record_success(generation)
+            annotate(**{"app.tool.stats_success": 1, "app.tool.stats_latency_ms": latency})
+            self._observe_tool_state(tool)
 
             # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
-            if tool.cache_ttl > 0:
-                self._set_cache(name, params, data, tool.cache_ttl, cache_rerank_top_k, reranked)
+            if use_cache and tool.cache_ttl > 0 and cache_version == self._cache_versions.get(name, 0):
+                self._set_cache(name, params, data, tool.cache_ttl, cache_rerank_top_k, reranked, context)
 
             return ToolResult(success=True, data=data, tool_name=name,
                               latency_ms=latency, reranked=reranked)
 
+        except asyncio.CancelledError:
+            if tool.breaker.state == CircuitState.HALF_OPEN:
+                tool.breaker.record_failure(generation)
+            raise
         except asyncio.TimeoutError:
             annotate(**{"app.error_code": "TIMEOUT"})
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
-            tool.breaker.record_failure()
+            tool.breaker.record_failure(generation)
             annotate(**{"app.tool.stats_failed": 1})
             self._observe_tool_state(tool)
             logger.error(f"工具超时: {name} ({tool.timeout_s}s)")
@@ -289,7 +308,7 @@ class MCPToolManager:
             annotate(**{"app.error_code": error_code(ex)})
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
-            tool.breaker.record_failure()
+            tool.breaker.record_failure(generation)
             annotate(**{"app.tool.stats_failed": 1})
             self._observe_tool_state(tool)
             logger.error(f"工具异常: {name} — {ex}")
@@ -323,7 +342,7 @@ class MCPToolManager:
             annotate(**{"app.tool.result_success": business_success})
             outcome("degraded" if business_success else "error", fallback=True)
             return ToolResult(
-                success=True,
+                success=False,
                 data=data,
                 tool_name=tool.name,
                 error=error,
@@ -373,10 +392,10 @@ class MCPToolManager:
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await generate(self._client, stage="rag.rewrite",
-                model=self._model, max_tokens=256, temperature=0.3,
+            resp = await asyncio.wait_for(generate(self._client, stage="rag.rewrite",
+                model=self._model, max_tokens=512, temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
-            )
+            ), timeout=10)
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             queries = json.loads(raw[s:e])
@@ -409,6 +428,8 @@ class MCPToolManager:
             raise ValueError("top_k must be between 1 and 20")
         timings: Dict[str, float] = {}
 
+        if not isinstance(query, str) or not query.strip() or len(query) > 2000:
+            return ToolResult(False, [], tool_name, error="query 必须是 1–2000 字符的非空文本")
         # 1. 查询改写：生成多角度子查询
         started = time.monotonic()
         sub_queries = await self.rewrite_query(query, n=config.rewrite_count)
@@ -479,7 +500,7 @@ class MCPToolManager:
             if degraded:
                 outcome("error", code="RETRIEVAL_FAILED")
             return ToolResult(success=not degraded, data=[], tool_name=tool_name,
-                              error="检索来源失败或降级" if degraded else None)
+                              error="检索来源失败或降级: " + "; ".join(dict.fromkeys(r.error for r in results if isinstance(r, ToolResult) and r.error)) if degraded else None)
 
         # 4. 对有限候选做 MMR，再用 LLM 重排到最终 Top-K。
         tool = getattr(self, "_tools", {}).get(tool_name)
@@ -489,7 +510,7 @@ class MCPToolManager:
         diverse = await self._mmr_select(tool, mmr_pool, rerank_limit, config.mmr_lambda)
         timings["mmr_ms"] = (time.monotonic() - started) * 1000
         started = time.monotonic()
-        reranked = await self._rerank(query, diverse, top_k)
+        reranked, was_reranked = await self._rerank_with_status(query, diverse, top_k)
         timings["rerank_ms"] = (time.monotonic() - started) * 1000
         logger.info(
             "rag_pipeline sub_queries=%d successful_lists=%d fused_count=%d mmr_count=%d final_count=%d "
@@ -500,7 +521,7 @@ class MCPToolManager:
         )
         annotate(**{"app.rag.output_count": len(reranked)})
         return ToolResult(success=True, data=reranked, tool_name=tool_name,
-                          reranked=len(diverse) > top_k,
+                          reranked=was_reranked,
                           error="部分检索来源失败或降级" if degraded else None)
 
     @staticmethod
@@ -568,9 +589,12 @@ class MCPToolManager:
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
-    @instrumented("rag.rerank", span_type="retrieval", result_count="app.rag.output_count", propagate_degradation=True)
-    @ranked
     async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
+        data, _ = await self._rerank_with_status(query, items, top_k)
+        return data
+
+    @instrumented("rag.rerank", span_type="retrieval", propagate_degradation=True)
+    async def _rerank_with_status(self, query: str, items: List[Any], top_k: int) -> Tuple[List[Any], bool]:
         """
         用 LLM 对召回结果重新打分排序。
 
@@ -580,7 +604,7 @@ class MCPToolManager:
         annotate(**{"app.rag.stage": "rerank", "app.rag.input_count": len(items), "app.rag.llm_used": len(items) > top_k})
         if len(items) <= top_k:
             outcome("skipped")
-            return items
+            return items, False
 
         # 将结果序列化为文本供 LLM 评分
         items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
@@ -595,40 +619,49 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await generate(self._client, stage="rag.rerank",
-                model=self._model, max_tokens=256, temperature=0.0,
+            resp = await asyncio.wait_for(generate(self._client, stage="rag.rerank",
+                model=self._model, max_tokens=2048, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            order = json.loads(raw[s:e])
-            if not isinstance(order, list):
-                raise ValueError("重排结果不是数组")
-            valid: List[int] = []
-            seen = set()
-            for index in order:
-                if type(index) is int and 0 <= index < len(items) and index not in seen:
-                    valid.append(index)
-                    seen.add(index)
-            valid.extend(index for index in range(len(items)) if index not in seen)
-            return [items[index] for index in valid[:top_k]]
+            ), timeout=30)
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                raise ValueError("重排输出被截断")
+            raw = extract_text_content(resp.content, separator="")
+            decoder = json.JSONDecoder()
+            order = None
+            for index, char in enumerate(raw):
+                if char == "[":
+                    try:
+                        candidate, _ = decoder.raw_decode(raw[index:])
+                    except ValueError:
+                        continue
+                    if isinstance(candidate, list):
+                        order = candidate
+                        break
+            if not order or any(type(i) is not int or not 0 <= i < len(items) for i in order):
+                raise ValueError("重排索引必须是非空、有效的整数列表")
+            # 去重后补齐模型遗漏的索引，避免召回结果无故消失。
+            order = list(dict.fromkeys(order))
+            order.extend(i for i in range(len(items)) if i not in order)
+            annotate(**{"app.rag.output_count": min(top_k, len(items))})
+            return [items[i] for i in order[:top_k]], True
         except Exception as ex:
             outcome("degraded", fallback=True, code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "RERANK_FAILED")
             logger.warning(f"重排失败，返回原始顺序: {ex}")
-            return items[:top_k]
+            return items[:top_k], False
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
-    def _cache_key(self, name: str, params: Dict, rerank_top_k: int = 0) -> str:
-        payload = {"params": params, "rerank_top_k": rerank_top_k}
+    def _cache_key(self, name: str, params: Dict, rerank_top_k: int = 0, context: Optional[Dict] = None) -> str:
+        payload = {"params": params, "rerank_top_k": rerank_top_k, "context": context or {},
+                   "version": self._cache_versions.get(name, 0)}
         return f"{name}:{hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()}"
 
-    def _get_cache(self, name: str, params: Dict, rerank_top_k: int = 0) -> Optional[Tuple[Any, bool]]:
-        key = self._cache_key(name, params, rerank_top_k)
+    def _get_cache(self, name: str, params: Dict, rerank_top_k: int = 0, context: Optional[Dict] = None) -> Optional[Tuple[Any, bool]]:
+        key = self._cache_key(name, params, rerank_top_k, context)
         if key in self._cache:
             data, expire_at, reranked = self._cache[key]
             if time.monotonic() < expire_at:
-                return data, reranked
+                return copy.deepcopy(data), reranked
             del self._cache[key]
         return None
 
@@ -640,35 +673,34 @@ class MCPToolManager:
         ttl: float,
         rerank_top_k: int = 0,
         reranked: bool = False,
+        context: Optional[Dict] = None,
     ) -> None:
         if len(self._cache) >= 5000:
             # 清掉最旧的 1/4
             for k in list(self._cache)[:1250]:
                 del self._cache[k]
-        self._cache[self._cache_key(name, params, rerank_top_k)] = (data, time.monotonic() + ttl, reranked)
+        self._cache[self._cache_key(name, params, rerank_top_k, context)] = (copy.deepcopy(data), time.monotonic() + ttl, reranked)
+
+    def invalidate_cache(self, name: str) -> None:
+        """失效工具缓存；版本号阻止更新前的在途请求重新写入旧结果。"""
+        self._cache_versions[name] = self._cache_versions.get(name, 0) + 1
+        for key in list(self._cache):
+            if key.startswith(f"{name}:"):
+                del self._cache[key]
 
     # ── 参数校验 ──────────────────────────────────────────────────────────────
 
     _TYPE_MAP = {"string": str, "number": (int, float), "integer": int, "boolean": bool, "array": list, "object": dict}
 
     def _validate_params(self, tool: Tool, params: Dict[str, Any]) -> None:
-        """根据工具的 JSON Schema 校验参数，不合法时抛出 ValueError。"""
-        schema = tool.schema
-        required = schema.get("required", [])
-        properties = schema.get("properties", {})
-
-        for field in required:
-            if field not in params:
-                raise ValueError(f"工具 {tool.name} 缺少必需参数: {field}")
-
-        for key, value in params.items():
-            if key in properties:
-                expected_type = properties[key].get("type")
-                if expected_type and expected_type in self._TYPE_MAP:
-                    if not isinstance(value, self._TYPE_MAP[expected_type]):
-                        raise ValueError(
-                            f"工具 {tool.name} 参数 {key} 类型错误: 期望 {expected_type}，实际 {type(value).__name__}"
-                        )
+        """按完整 JSON Schema 校验参数，不合法时抛出 ValueError。"""
+        from jsonschema import validators, ValidationError
+        validator = validators.validator_for(tool.schema)(tool.schema)
+        try:
+            validator.validate(params)
+        except ValidationError as ex:
+            path = ".".join(str(p) for p in ex.absolute_path) or "参数"
+            raise ValueError(f"工具 {tool.name} 的 {path} 未通过 JSON Schema 校验（{ex.validator}）") from None
 
     @staticmethod
     def _clean_text(value: Any) -> str:

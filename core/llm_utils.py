@@ -2,7 +2,7 @@
 from typing import Any, Iterable, List
 
 
-def extract_text_content(content: Iterable[Any]) -> str:
+def extract_text_content(content: Iterable[Any], separator: str = "\n") -> str:
     """Return text blocks from Anthropic-style response content."""
     texts: List[str] = []
     for block in content or []:
@@ -19,4 +19,4 @@ def extract_text_content(content: Iterable[Any]) -> str:
         if isinstance(text, str) and (block_type in (None, "text")):
             texts.append(text)
 
-    return "\n".join(t for t in texts if t)
+    return separator.join(t for t in texts if t)

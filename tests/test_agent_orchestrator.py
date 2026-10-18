@@ -114,9 +114,9 @@ def test_routing_decision_can_target_escalation_pool():
 def test_composite_request_routes_explicit_billing_signal_as_supporting_agent():
     orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
     orchestrator._pool = {
-        AgentType.GENERAL: [object()],
-        AgentType.TECHNICAL: [object()],
-        AgentType.BILLING: [object()],
+        AgentType.GENERAL: [GeneralAgent(FakeClient(), "test")],
+        AgentType.TECHNICAL: [TechnicalAgent(FakeClient(), "test")],
+        AgentType.BILLING: [BillingAgent(FakeClient(), "test")],
     }
 
     decision = orchestrator._route_decision(make_request())
@@ -211,9 +211,139 @@ def test_tool_use_round_trip_executes_only_whitelisted_tool():
 
     assert response.success is True
     assert response.tools_used == ["lookup_error_code"]
+    assert len(response.tool_traces) == 1
+    assert response.tool_traces[0]["tool_name"] == "lookup_error_code"
+    assert response.tool_traces[0]["input"] == {"error_code": "401"}
+    assert response.tool_traces[0]["success"] is True
     assert len(client.calls) == 2
     assert {tool["name"] for tool in client.calls[0]["tools"]} == {
         "lookup_error_code",
         "build_diagnostic_plan",
     }
     assert "tool_result" in str(client.calls[1]["messages"])
+
+
+def test_concurrent_requests_keep_tool_traces_isolated():
+    class ToolUseBlock:
+        type = "tool_use"
+
+        def __init__(self, code):
+            self.id = f"toolu_{code}"
+            self.name = "lookup_error_code"
+            self.input = {"error_code": code}
+
+    class TextBlock:
+        type = "text"
+
+        def __init__(self, text):
+            self.text = text
+
+    class ConcurrentClient:
+        class Messages:
+            async def create(inner, **kwargs):
+                messages = kwargs["messages"]
+                last_content = messages[-1]["content"]
+                if isinstance(last_content, list):
+                    code = "500" if "500" in str(last_content) else "401"
+                    await asyncio.sleep(0)
+                    return type("Response", (), {"content": [TextBlock(f"{code} 排查完成")]})()
+                code = "500" if "500" in str(last_content) else "401"
+                await asyncio.sleep(0.01 if code == "401" else 0)
+                return type("Response", (), {"content": [ToolUseBlock(code)]})()
+
+        def __init__(self):
+            self.messages = self.Messages()
+
+    async def run_both():
+        agent = TechnicalAgent(ConcurrentClient(), "test-model")
+        return await asyncio.gather(
+            agent.handle(make_request(message="登录报 401", entities={"error_code": ["401"]})),
+            agent.handle(make_request(message="页面报 500", entities={"error_code": ["500"]})),
+        )
+
+    first, second = asyncio.run(run_both())
+    assert first.tool_traces[0]["input"] == {"error_code": "401"}
+    assert second.tool_traces[0]["input"] == {"error_code": "500"}
+
+
+def test_monitor_penalty_falls_back_to_general_agent():
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    general = GeneralAgent(FakeClient(), "test-model")
+    technical = TechnicalAgent(FakeClient(), "test-model")
+    billing = BillingAgent(FakeClient(), "test-model")
+    technical.stats.monitor_penalty = 0.5
+    orchestrator._pool = {
+        AgentType.GENERAL: [general],
+        AgentType.TECHNICAL: [technical],
+        AgentType.BILLING: [billing],
+    }
+
+    decision = orchestrator._route_decision(make_request(
+        message="登录报 401",
+        entities={"error_code": ["401"]},
+    ))
+
+    assert decision.primary_agent is AgentType.GENERAL
+    assert decision.supporting_agents == []
+    assert "monitor_fallback=[technical]" in decision.reason
+
+
+def test_recovery_probe_allows_only_one_request_and_recovers():
+    import time
+    from types import SimpleNamespace
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def reply(**kwargs):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(content=[{'type':'text','text':'恢复成功'}])
+        agent = TechnicalAgent(SimpleNamespace(messages=SimpleNamespace(create=reply)), 'test')
+        agent.stats.set_penalty(.8)
+        assert not agent.stats.available()
+        agent.stats.retry_at = time.monotonic() - 1
+        first = asyncio.create_task(agent.handle(make_request()))
+        await entered.wait()
+        assert not agent.stats.available()
+        second = await agent.handle(make_request())
+        assert not second.success
+        release.set()
+        assert (await first).success
+        assert agent.stats.available()
+        assert agent.stats.monitor_penalty == 0
+        assert agent.stats.recent()[0] == 1
+    asyncio.run(run())
+
+
+def test_failed_probe_reopens_and_window_expires():
+    import time
+    from agents.agent_orchestrator import AgentStats
+    stats = AgentStats()
+    stats.set_penalty(.8)
+    stats.retry_at = time.monotonic() - 1
+    stats.probe_running = True
+    stats.record(False, 10)
+    assert not stats.available()
+    assert not stats.probe_running
+    stats.samples.clear()
+    stats.samples.append((time.monotonic()-301, False, 10000))
+    assert stats.recent() == (0, 1.0, 0.0)
+
+
+def test_cancelled_probe_releases_exclusive_slot():
+    import time
+    from types import SimpleNamespace
+    async def run():
+        entered = asyncio.Event()
+        async def reply(**kwargs):
+            entered.set()
+            await asyncio.sleep(30)
+        agent = TechnicalAgent(SimpleNamespace(messages=SimpleNamespace(create=reply)), 'test')
+        agent.stats.set_penalty(.8)
+        agent.stats.retry_at = time.monotonic()-1
+        task = asyncio.create_task(agent.handle(make_request()))
+        await entered.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert not agent.stats.probe_running
+        assert not agent.stats.available()
+    asyncio.run(run())

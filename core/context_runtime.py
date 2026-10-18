@@ -219,6 +219,7 @@ class ContextPipeline:
                                                              summary=light.summary)
             span.set_attribute("app.intent.name", intent.intent.value)
             span.set_attribute("app.intent.confidence", intent.confidence)
+        req.conversation_state = getattr(light, "state", {})
         req.history = light.recent_history or None
         req.intent, req.intent_group = intent.intent, intent.intent_group
         req.intent_confidence, req.urgency, req.entities = intent.confidence, intent.urgency, intent.entities
@@ -286,7 +287,7 @@ class ContextPipeline:
 
     async def capture(self, req: Any, result: Any) -> None:
         with observed("experience.submit", span_type="experience") as span:
-            if self.experience is None:
+            if self.experience is None or getattr(result, "status", "success") != "success":
                 set_outcome(span, "skipped")
             else:
                 try:

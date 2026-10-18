@@ -45,8 +45,9 @@ class FakeRedis:
         for item in list(self.sets[key]):
             yield item
 
-    async def lpush(self, key, value):
-        self.lists[key].insert(0, value)
+    async def lpush(self, key, *values):
+        for value in values:
+            self.lists[key].insert(0, value)
 
     async def lrange(self, key, start, end):
         return self.lists[key][start:] if end == -1 else self.lists[key][start:end + 1]
@@ -66,6 +67,15 @@ class FakeRedis:
     async def setex(self, key, ttl, value):
         self.values[key] = value
 
+    async def eval(self, script, count, old, new):
+        if old in self.lists and new not in self.lists:
+            self.lists[new] = self.lists.pop(old)
+            return 1
+        if old in self.values and new not in self.values:
+            self.values[new] = self.values.pop(old)
+            return 1
+        return 0
+
     async def aclose(self):
         pass
 
@@ -74,7 +84,18 @@ class FakeRedis:
         class Pipeline:
             def __init__(self):
                 self.commands = []
+                self.watching = False
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def watch(self, *keys):
+                self.watching = True
+            def multi(self):
+                self.watching = False
             def __getattr__(self, name):
+                if self.watching:
+                    return getattr(owner, name)
                 def queue(*args, **kwargs):
                     self.commands.append((name, args, kwargs))
                     return self
@@ -158,3 +179,26 @@ async def idle(evolution):
         await asyncio.gather(*tasks)
         await asyncio.sleep(0)
     raise AssertionError("worker did not become idle")
+
+
+def atomic_http_stub(mem):
+    """Adapt legacy component mocks to the atomic HTTP memory protocol.
+
+    Real transaction/lease/idempotency behavior is exercised with fakeredis separately.
+    """
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+    @asynccontextmanager
+    async def conversation(*args):
+        yield
+    async def commit(user, conv, request_id, message, response, trace=None, *, state=None, source=None):
+        from memory.conversation_memory import MsgRole
+        await mem.add_message(user, conv, MsgRole.USER, message, source=source)
+        await mem.add_message(user, conv, MsgRole.ASSISTANT, response["response"], source=source)
+    mem.conversation = conversation
+    mem.get_turn_receipt = AsyncMock(return_value=None)
+    mem.get_trace = AsyncMock(return_value=None)
+    mem.recent_traces = AsyncMock(return_value=[])
+    mem.finalize_receipt = AsyncMock()
+    mem.commit_turn = commit
+    return mem

@@ -13,6 +13,8 @@ ChromaDB 在这里的角色：
 """
 import asyncio
 import hashlib
+import json
+import os
 import logging
 import re
 import threading
@@ -52,6 +54,7 @@ class KnowledgeBase:
         import chromadb
 
         self.rag_config = rag_config or RAGConfig.from_env()
+        self._write_lock = threading.RLock()
         self._bm25_lock = threading.RLock()
         self._bm25: Optional[BM25Okapi] = None
         self._bm25_items: tuple[Dict[str, Any], ...] = ()
@@ -67,7 +70,9 @@ class KnowledgeBase:
             self._client.heartbeat()
             self._use_server = True
             logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
+        except Exception as ex:
+            if os.getenv("ECHOMIND_ENV", "development").lower() == "production":
+                raise RuntimeError("生产环境 ChromaDB 不可用") from ex
             logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
             self._client = chromadb.PersistentClient(
                 path=chroma_path,
@@ -82,7 +87,7 @@ class KnowledgeBase:
         )
 
         # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
+        if self._collection.count() == 0 and os.getenv("ECHOMIND_ENV", "development").lower() != "production" and os.getenv("ECHOMIND_SEED_DEMO_DOCS", "true").lower() in {"true", "1", "yes"}:
             self._load_default_docs()
         else:
             self._rebuild_bm25_index()
@@ -96,26 +101,55 @@ class KnowledgeBase:
         documents 格式: [{"title": "...", "content": "..."}, ...]
         长文档会自动切片（每片 500 字）。
         """
-        ids, docs, metas = [], [], []
-
+        # 相同文档身份在同一批次只采用最后一个版本，避免重复 ID。
+        prepared = {}
         for doc in documents:
-            title   = doc.get("title", "")
-            content = doc.get("content", "")
-            chunks  = self._chunk_text(content, chunk_size=500)
+            title, content = doc.get("title", ""), doc.get("content", "")
+            if not isinstance(title, str) or not isinstance(content, str):
+                raise ValueError("文档 title 和 content 必须是字符串")
+            if not title.strip() or not content.strip():
+                raise ValueError("文档标题和内容不能为空")
+            explicit_id = doc.get("document_id")
+            if explicit_id is not None and (not isinstance(explicit_id, str) or not explicit_id.strip()):
+                raise ValueError("document_id 必须是非空字符串")
+            identity = json.dumps(["explicit", explicit_id] if explicit_id else ["title", title], ensure_ascii=True)
+            if not isinstance(identity, str):
+                raise ValueError("document_id 必须是字符串")
+            prepared[identity] = (title, content, bool(doc.get("document_id")))
 
-            for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
-                ids.append(doc_id)
-                docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
-
-        if ids:
-            # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
-            self._rebuild_bm25_index()
-            logger.info(f"知识库导入 {len(ids)} 个文档片段")
-
-        return len(ids)
+        count = 0
+        with self._write_lock:
+            for identity, (title, content, explicit) in prepared.items():
+                document_id = hashlib.sha256(identity.encode()).hexdigest()
+                chunks = self._chunk_text(content, chunk_size=500)
+                version = hashlib.sha256(content.encode()).hexdigest()
+                ids = [f"{document_id}:{i}" for i in range(len(chunks))]
+                existing = self._collection.get(where={"document_id": document_id}, include=["metadatas"])
+                old_ids = set(existing["ids"])
+                # 仅迁移归属可验证的旧身份；旧显式 ID 与 title: 前缀冲突时保留旧记录供核验。
+                kind, value = json.loads(identity)
+                legacy_identity = value if explicit else f"title:{title}"
+                if not explicit or not value.startswith("title:"):
+                    legacy_id = hashlib.sha256(legacy_identity.encode()).hexdigest()
+                    previous = self._collection.get(where={"document_id": legacy_id}, include=["metadatas"])
+                    old_ids.update(i for i, meta in zip(previous["ids"], previous["metadatas"])
+                                   if (meta or {}).get("title") == title)
+                if not explicit:
+                    # 兼容旧版只有 title/chunk_index 元数据的片段。
+                    legacy = self._collection.get(where={"title": title}, include=["metadatas"])
+                    old_ids.update(i for i, meta in zip(legacy["ids"], legacy["metadatas"])
+                                   if not (meta or {}).get("document_id"))
+                self._collection.upsert(ids=ids, documents=chunks, metadatas=[
+                    {"title": title, "document_id": document_id, "version": version,
+                     "chunk_index": i, "total_chunks": len(chunks)} for i in range(len(chunks))
+                ])
+                stale = old_ids - set(ids)
+                if stale:
+                    self._collection.delete(ids=list(stale))
+                count += len(chunks)
+        self._rebuild_bm25_index()
+        logger.info("知识库写入 %s 个文档片段", count)
+        return count
 
     async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
@@ -148,6 +182,7 @@ class KnowledgeBase:
                     "vector_score": round(1.0 - dist, 6),
                     "chunk":    meta.get("chunk_index", 0),
                     "retrieval_sources": ["vector"],
+                    "document_id": meta.get("document_id", ""), "version": meta.get("version", ""),
                 })
         return items
 
@@ -349,6 +384,8 @@ class KnowledgeBase:
         current = ""
         # 按句子切分
         sentences = text.replace("\n", "。").split("。")
+        sentences = [sent[i:i + chunk_size] for sent in sentences
+                     for i in range(0, len(sent), chunk_size)]
         for sent in sentences:
             sent = sent.strip()
             if not sent:

@@ -1,3 +1,4 @@
+from memory_fakes import atomic_http_stub
 """Offline experience lifecycle, isolation, recovery, and integration contracts."""
 import asyncio
 import json
@@ -279,7 +280,7 @@ def test_http_capture_feedback_and_failure_isolation(monkeypatch):
                           begin_turn=AsyncMock(), add_message=AsyncMock())
     pipeline = ContextPipeline(orch, ContextPlanner(None, "test", True), memory=mem, experience=m)
     monkeypatch.setattr(main, "_orchestrator", orch)
-    monkeypatch.setattr(main, "_memory", mem)
+    monkeypatch.setattr(main, "_memory", atomic_http_stub(mem))
     monkeypatch.setattr(main, "_context_pipeline", pipeline)
     client = TestClient(main.app)
     response = client.post("/chat", json={"message": "OAuth 登录报 401", "user_id": "u1", "debug_context": True})

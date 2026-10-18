@@ -20,6 +20,7 @@ SOURCES = ("memory", "profile", "knowledge", "skill", "experience")
 class LightweightContext:
     recent_history: list[dict[str, str]] = field(default_factory=list)
     summary: str = ""
+    state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
