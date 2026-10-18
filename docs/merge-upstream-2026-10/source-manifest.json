@@ -1,0 +1,571 @@
+{
+  "source_commit": "ef847eb5b719ef98be9d5673f3429e62cd88109e",
+  "base_commit": "4f13a0b",
+  "files": [
+    {
+      "path": ".dockerignore",
+      "sha256": "bade6b1b17c7e83314ce5db614c480fb3393d5fa82e2f640eaa8575dcaf347a9",
+      "mode": "100644"
+    },
+    {
+      "path": ".env.example",
+      "sha256": "e674be509b8694997fd47fd11c4487300b9d4caa23dcd0ee65c1be68b4bbe125",
+      "mode": "100644"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "ff0d37769413969e9a3bd44b1c4dee6c60eb5ac9723a22fe165ca7d53a4271f2",
+      "mode": "100644"
+    },
+    {
+      "path": "2026.08.29改动说明.md",
+      "sha256": "d4c3f72e4089759a81bf484e46b035332e523c1d6595df67221c35e6e18c7666",
+      "mode": "100644"
+    },
+    {
+      "path": "2026.09.28更新说明.md",
+      "sha256": "0f6aa26b828f52aab56378288c67bb204849100d7594c4409f8a38f764d68d0d",
+      "mode": "100644"
+    },
+    {
+      "path": "2026.10.02更新说明.md",
+      "sha256": "7709017dc10fb212df9867f612d0f95d56f5d82d22f2c99392a6855b05137ec7",
+      "mode": "100644"
+    },
+    {
+      "path": "2026.10.13更新说明.md",
+      "sha256": "34d4d687b29ebef7f6c17c1ede452a39110d08c376960a38bd0060ee9c231e18",
+      "mode": "100644"
+    },
+    {
+      "path": "2026.10.14更新说明.md",
+      "sha256": "a53dfafd0464d1ed9ee20b288f01a1979c57148173ae722f5f12ef7332e9dc0d",
+      "mode": "100644"
+    },
+    {
+      "path": "Dockerfile",
+      "sha256": "36a727c1229543c3c951c6b3c288c76f2704b6e85d667c2ecbd90c7e5f0812e8",
+      "mode": "100644"
+    },
+    {
+      "path": "README.md",
+      "sha256": "bb16a8feab6f9472ec5706a69d321527f40d0f04c2348ba5483325420b38aecb",
+      "mode": "100644"
+    },
+    {
+      "path": "agents/agent_orchestrator.py",
+      "sha256": "54e89800c01af6eefe40fec8ef9006cb3ff03ad24b274dd6af8386b28e25df08",
+      "mode": "100644"
+    },
+    {
+      "path": "agents/tools.py",
+      "sha256": "0392280b3ff8c84f6ce4c07179f4dde2f4fe596984adfc1a59867ec540138793",
+      "mode": "100644"
+    },
+    {
+      "path": "api/main.py",
+      "sha256": "d8596e40bf3010fd58face1294006a954f5e0813f8877493ef58f93a42481896",
+      "mode": "100644"
+    },
+    {
+      "path": "build-image.sh",
+      "sha256": "3e0edfbe434680fcc2c84e5b40534b300668adc26eeab4c035ecd4056879b052",
+      "mode": "100755"
+    },
+    {
+      "path": "config/mcp_servers.json",
+      "sha256": "06b22728deb9fe55ada5cee4024340f8268379498ece481c8ba9a401ec920eec",
+      "mode": "100644"
+    },
+    {
+      "path": "config/nginx/frontend.conf",
+      "sha256": "d18810a583195eca1b1358a75522fd1746637a050ab753adb439becfd37cb23a",
+      "mode": "100644"
+    },
+    {
+      "path": "config/nginx/nginx.conf",
+      "sha256": "923cadfb191855046ea541cf7b4e8b15212b071a1da26be5c1ae0c91da3f3e50",
+      "mode": "100644"
+    },
+    {
+      "path": "config/nginx/web-gateway.conf",
+      "sha256": "752df8810d8163236a5f532cb87aad416cf4c3309404bd21c700e4567b99e840",
+      "mode": "100644"
+    },
+    {
+      "path": "config/prometheus.yml",
+      "sha256": "0ba284e25ab6868f88a78023fda9dadda4c30388e7df46e28434696f1a5ba339",
+      "mode": "100644"
+    },
+    {
+      "path": "core/access.py",
+      "sha256": "58cd6d00536c27c549726cff790ee191a34adb3bcc49f479850fa2c71f038327",
+      "mode": "100644"
+    },
+    {
+      "path": "core/concurrency.py",
+      "sha256": "25b90fff7dc29497a02cff56c1ebb117ba8467653b3d9b0dcdfa33353e9120e8",
+      "mode": "100644"
+    },
+    {
+      "path": "core/conversation_state.py",
+      "sha256": "fbdd0923e9818d53893155fbf939db84117ff9a30ad33afe739665fba6e7555e",
+      "mode": "100644"
+    },
+    {
+      "path": "core/intent_embedding.py",
+      "sha256": "4a2cda1a5960d612a3cea04aad56601338518182ea89d61513ddfa988e2dd38b",
+      "mode": "100644"
+    },
+    {
+      "path": "core/intent_recognizer.py",
+      "sha256": "0888b018e6f621c2898567a8aa134a38cf8c538b28fcf90c148a50f87fbe3a35",
+      "mode": "100644"
+    },
+    {
+      "path": "core/llm_utils.py",
+      "sha256": "8f7dbda693b254ec5779a3ee6186b6c9cdc0f82a7705ac7a664cfc1e4a58047b",
+      "mode": "100644"
+    },
+    {
+      "path": "core/redaction.py",
+      "sha256": "b7e4a065e28d835a0815fe74f6ab5facdacc0cfef959729a2f59e4b539d918e8",
+      "mode": "100644"
+    },
+    {
+      "path": "core/skill_loader.py",
+      "sha256": "26618d02cde5592955bd45b7a6752e6fbfa3e06de76ed325658f5257f142aaaf",
+      "mode": "100644"
+    },
+    {
+      "path": "docker-compose.web.yml",
+      "sha256": "8b069d1dbbfa2ad35b23a9300d7be3511bce4e6984e0bd997778ae8b3a0b6996",
+      "mode": "100644"
+    },
+    {
+      "path": "docker-compose.yml",
+      "sha256": "303d799d3da21d8a0a0a5c06f54a2cbf709e07e69b30fd4b9e482d3b093c87e4",
+      "mode": "100644"
+    },
+    {
+      "path": "docker-deploy.sh",
+      "sha256": "32bd102cb9bb88c7ea1f2fe74be97cbbdccaaafcb82a338c869c0e700e47188d",
+      "mode": "100755"
+    },
+    {
+      "path": "evaluation/evaluator.py",
+      "sha256": "b183a860864a3fc820554d911e55e190426aa558bc95be01209898d2a81f4a1b",
+      "mode": "100644"
+    },
+    {
+      "path": "evaluation/few_shot.py",
+      "sha256": "49c711cda541f1e28642ddce1fbdd40bca793a285917651f22065124da6865ae",
+      "mode": "100644"
+    },
+    {
+      "path": "evaluation/jobs.py",
+      "sha256": "0eca1d5025e1d8b005113410598f47adc543396668ceaa519a5c9da59e580937",
+      "mode": "100644"
+    },
+    {
+      "path": "memory/conversation_memory.py",
+      "sha256": "c4f91dbde1a0b5e033736d1eabb231a3ccf09ef8bf1497e60cae96a10c2f2355",
+      "mode": "100644"
+    },
+    {
+      "path": "monitor/performance_monitor.py",
+      "sha256": "54d2062cfe77f704c126faec382eb29d1db64279a45c41fc05bfe523d751185c",
+      "mode": "100644"
+    },
+    {
+      "path": "requirements-dev.txt",
+      "sha256": "d5c4a266d8c1aedd2ab9598d86fc1b0a509dcecb802fa7c3b97f3be615e87794",
+      "mode": "100644"
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "99eddd96c4629d220d5a964ed7f9d2ce481ec1340c8bb35032ab8ad67ed6e028",
+      "mode": "100644"
+    },
+    {
+      "path": "run-image.sh",
+      "sha256": "3dc430aa1c04f7e1a34292163cc7ecde518d2eef7b8a3f675333e4f176930aa7",
+      "mode": "100755"
+    },
+    {
+      "path": "skills/README.md",
+      "sha256": "3c86fc493c3c73c79e1f01bb85067c874fba59b61f21bb7e9a1bd381235c9aa5",
+      "mode": "100644"
+    },
+    {
+      "path": "skills/billing_support/SKILL.md",
+      "sha256": "60baeba56cb91d2113d529f999f2d14da67425ba11efdc5175c9cf90fbb7223f",
+      "mode": "100644"
+    },
+    {
+      "path": "skills/general_customer_service/SKILL.md",
+      "sha256": "840a45efc7e35abc75b97c37bd47703de53a73ec8844ca29f342f5babddbe037",
+      "mode": "100644"
+    },
+    {
+      "path": "skills/technical_support/SKILL.md",
+      "sha256": "7e730fb06966314f6530f478debe81bd2a854501f168c5406465df674dcb9cb6",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/mcp_fixture_server.py",
+      "sha256": "054c146fc73d53634abec35de65e88b52ff72b00ad9676bba1cb14a17d83f1c4",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_agent_orchestrator.py",
+      "sha256": "d82bb2b6d2217b85de45012485766603eda9b878be4e3422d2cf069fe656feb4",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_audit_regressions.py",
+      "sha256": "21bc8824f58e1e6dec3db412d61e541f45300a21fdacc3a4dfad2e4cb2bc9e88",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_chat_reliability.py",
+      "sha256": "eb7907711f12c6700a760247f6517c65d245e71c2e53e025377805571c76d70d",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_concurrency.py",
+      "sha256": "e03b33e09e446ad445b9d61cef9235b19c5e634e3cf0af4563434719a1e5fd25",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_eval_jobs.py",
+      "sha256": "be5a5a44f23c1d9f72bd9292a46fd68a8529c6ca8d759cbb1a272b7ca6b2e50b",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_evaluator.py",
+      "sha256": "eafaafa58bb6a1e63e3b4da9dfdd8edd02281900235d389229a56c9195a10b51",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_intent_embedding.py",
+      "sha256": "df4a90e14b5642316df7e95d0192246e6e2272e43834e3e49f4db58e02b46bfb",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_intent_recognizer.py",
+      "sha256": "2978253bf724fbde77de046648e91090e1a11a2d409a1f31dcb483b021503ede",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_knowledge_base.py",
+      "sha256": "01c2567984b17ef3de837f02717f0e74800838815198a95308e4095a697828ca",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_optimization_regressions.py",
+      "sha256": "02f4e5f1c02cf53aa6ab99174b9358c95d8a7ae39d1cc3539d11c13c67142f11",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_standard_mcp.py",
+      "sha256": "e28a30301b24007a5823b54a032ed6612f1bc236c0b065e8f84c8fddfd0e5510",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/test_tool_manager.py",
+      "sha256": "573a9ae49d8754cb1e9dab4a8d5ae805f413e2ea54b889be3ccb199431ae3b2f",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/verify_chat_atomic.py",
+      "sha256": "7c9e5fd762ce4260674697d6844873a03d494f98ef7bf9025bc846af6ce6d347",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/verify_memory_concurrency.py",
+      "sha256": "d775908137f492d65ff8bf969038d7366917c75662c2b77b05066497e9c11ec7",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/verify_memory_keys.py",
+      "sha256": "6b51620ce73fe58e9f2d9f0f7b7650b25d3261339c14d5c79edcf59e9a2b1e70",
+      "mode": "100644"
+    },
+    {
+      "path": "tests/verify_request_concurrency.py",
+      "sha256": "1eb73384eee8a52613b489e4baf5a45251a9e79bbd04dacd7cc5602e85cc524d",
+      "mode": "100644"
+    },
+    {
+      "path": "tooling/__init__.py",
+      "sha256": "219e790ba196ff2d0002b5593d633f59dffae35c18b903fb88cdb3c5bf3338e9",
+      "mode": "100644"
+    },
+    {
+      "path": "tooling/knowledge_base.py",
+      "sha256": "7851805a9b636a27f1aa9f05dfdd370a9881270b5f2a2683617cba452e57429a",
+      "mode": "100644"
+    },
+    {
+      "path": "tooling/mcp_client.py",
+      "sha256": "ef89ca6498d21ddca0b90275634e1338eab52b301ecc0d9ed7f28c103b118398",
+      "mode": "100644"
+    },
+    {
+      "path": "tooling/mcp_server.py",
+      "sha256": "d48c1da2c05a49b18d83dd058dd8f761c7be62e0359ec2f499cc4669bf74d8b1",
+      "mode": "100644"
+    },
+    {
+      "path": "tooling/tool_manager.py",
+      "sha256": "43b74d45fd0fa90d50c7b80400c7573da2179ec61c2732713806aa5b9efca9b6",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/Echo Agent一周如何速成.md",
+      "sha256": "83f9c31a7e8ac8fd9d38fac2bcc2f604e83df8e1b2ac7bbb5d5f318794128e68",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/EchoMind 场景扩展指南.md",
+      "sha256": "6035ed935940fd5eeb50489d5392cb3334ae372b218c4f492ddb067052db3c1d",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/EchoMind学习文档.md",
+      "sha256": "48526694d2983e2c70ca80940ba0e1bc0e777db126c549f463ec1f5add042184",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/EchoMind定位与技术亮点.md",
+      "sha256": "7d9be4444a348e05f3051c46f2838b239fc589df66ec00e6c7f809d7320630aa",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/NexusOps企业智能运营协同中枢.md",
+      "sha256": "da3b4200c6fe6baef2345dc9baa799992993f0d524af19ba93048a3bd33b6d23",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/architecture/01-overall-architecture.svg",
+      "sha256": "376a1a446ab2b7ed2a114a794bb1309246110968a465f2dd224960a01b2d48af",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/architecture/02-chat-flow.svg",
+      "sha256": "d0e10b7103b1aac9c1bdd26db8d45e65aae896f416f39858e5f9aff5ff19a4df",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/architecture/03-agent-skills.svg",
+      "sha256": "9313626f58fa9ed18a52cd616939bf70e9505dfad170e2d18326ce7133f7fbea",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/architecture/04-data-storage.svg",
+      "sha256": "b7db491493c4962bb142f67eb8c30126c1353cf79320240bb8be0f97691495bf",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/architecture/05-monitor-eval.svg",
+      "sha256": "170f13402a40a4d6c2ef272406e4bc30964a9db511190554e17fc348eb868f63",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/architecture/06-deployment.svg",
+      "sha256": "6aca9825a0768abfe11b72ab8993fe9c34daeed4adeb15343d3a12033783d7c9",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/01-chat-flow.png",
+      "sha256": "5d0f47d8a74e36b425492d5668c84e5f8273f91871c586e757e0d7ac0787fa39",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/02-intent-fusion.png",
+      "sha256": "42486f64ee64754706f9ac1b4d9525bcfa7d7af31c4600544d1f6cc4a9b45ff9",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/03-agent-routing.png",
+      "sha256": "2b5a95d3981c08c32f18a9c91b7c4aed2a2562380602d166d481189246bfcac8",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/04-rag-tool-flow.png",
+      "sha256": "9c421c8f3518588901a91dba0ad0c191f466586e64b2243d6445e98dd9d1a589",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/05-memory-compression.png",
+      "sha256": "6daeb13986a65d041481118cdb1c8fab5f4182461515e0b8bd74be4a3a973a9e",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/chat-flow-current.mmd",
+      "sha256": "fbc579eab69e3b0cede40757ea76ae4ed68606a357d9c74e70a7f6c7b08a4f71",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/chat-flow-current.png",
+      "sha256": "5f7743245b12698a31906044519ca28fb5165ffeea09d7d28fad70b9ffe4d54c",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/memory-maintenance-current.mmd",
+      "sha256": "163988156c69eea2a0e8365984215f3c2d792c0dd1b218abb780072dbe46b3a1",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/memory-maintenance-current.png",
+      "sha256": "d1f4aedaeadf244d9fd1070b917bebb3bef44b0f7a583917846db72f91b4b024",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/flows/render_business_flows.py",
+      "sha256": "e77b80bcf1e6fdc157315c7716c890dac36e73187fad595e241616127eef8a7f",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/assets/posters/echomind-update-poster.svg",
+      "sha256": "6fd11b2afd7d1f5ad69a37a62132639b7e2921c21baf7b5e8533fb38db447dd3",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/业务流程说明.md",
+      "sha256": "af7530cc453564f1b2de04ebfd92dcd82ce25344fab860616a12c704a63a6cee",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/完整使用指南.md",
+      "sha256": "6d9492ef31aba609140d8fed3080217aa4c483f371751ea28dfd053daa565e41",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/带数据指标的加强版简历模板.md",
+      "sha256": "f299491187c16353f184be3e10fc860a1daaddeaa91ba60c91ac7ffc6a42b136",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/技术亮点.md",
+      "sha256": "e99706b29e0a03cd0f1a1a244d2fda21b98860a203eaafb220796b449700b0dc",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/01-项目全貌与基础概念.md",
+      "sha256": "f7b65e111142f87198b131f19f37a174ea0b11f27a02592d3ae370742a029a0b",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/02-环境搭建与页面体验.md",
+      "sha256": "c6d7132891a26be869f0279e92003e6a0713c550bddda8c1a6def325fd726821",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/03-架构代码与数据存储.md",
+      "sha256": "4c71dc3e2d11c85f09165ba9aeea3778e26e4255b73856aef1ceef3b2b5afc8f",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/04-请求入口鉴权与重试回执.md",
+      "sha256": "23736d2e8a016489561651f439eeedaf1ed15ca89bef9eee88cc72643ac0e78a",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/05-上下文读取与多轮状态.md",
+      "sha256": "f563bb4f88bebff539150c3aeb67aa73e465f9542b09fb7fb7c0c7357ad7ebdc",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/06-意图识别与三路融合.md",
+      "sha256": "ed9b13ab7676bface654f2653c8d6493b6462f0469af52c02a6d8ff26ffdef9e",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/07-Agent路由Skills与工具执行.md",
+      "sha256": "d20cf5a419cb43d54c4a599eaa7dbf6c38398ba797f56e7cf13554ffb7395eed",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/08-知识库RAG与MCP扩展.md",
+      "sha256": "087ac9de7ddc0d80f6d81e3f8484807cb5fdb45ebd670e284579b7aa924caacc",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/09-记忆提交压缩与画像更新.md",
+      "sha256": "745f87d5b460f4a5fc2c2788dc431ed8465227ff54a866ed176d22b73a96cf74",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/10-监控降权与恢复.md",
+      "sha256": "ceaa3e65b18ed9ff3ff51d4207086c713022c7f2bb7188b23983641a203f4b33",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/11-评测Few-shot与回归基线.md",
+      "sha256": "7d38d54ec4da33ce35b1dc14231742f9081d94ee729f8e2e6de00699283bf9e0",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/12-测试与故障排查.md",
+      "sha256": "1b3b10672dbb7d25a4983fd82070c8a5c17872db0502f899886d8ee376750112",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/README.md",
+      "sha256": "d1fcfc0b8715cdce4f9ee2b8407b362176f75344d623cc3f891e1504999a0347",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/examples/compose.metrics-auth.yml",
+      "sha256": "94747e5016250d89fa5c6f03441d2dfb7629b9ca02812f006599aa3ad027546f",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/examples/compose.tutorial.yml",
+      "sha256": "ce6a5c7f4a5cf4a87541582ad960cb0055520adcf92fb2eda625c955c7226df9",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/examples/prometheus.auth.yml",
+      "sha256": "5451341a4052cc53d8ee2e14d0a373695fb66b9f8fefa6b309751c63b3cb2cff",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/scripts/check_docs.py",
+      "sha256": "c00a21858e3181384c7e4cea5f0ea7126d3ebaf1fc18e87a452a32c0b0df1f0b",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/完善说明.md",
+      "sha256": "f94e864605796b7f73afbf28c64aceaef6cb1f1d1aa34b63eb5147c1b9ed6315",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/教程/附录-接口配置与数据字典.md",
+      "sha256": "47b5f06cf4f56e87a7b25285760a94a6c8dab3109a208c180c343f0ff6e6b50a",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/文档中心.md",
+      "sha256": "98a2f73d34dc475b04ef6e299dde38894f24f519c0842c7f1f5928d70b3c7bc2",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/架构图.md",
+      "sha256": "5a83baff3256d8319e05d80392a889ecdeb822fc9b52d12b6ee53438d3a0e664",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/简历包装.md",
+      "sha256": "4e650074a5128ad30161dee4834b1e4dd8774b99f978d8c952f1511bc4042815",
+      "mode": "100644"
+    },
+    {
+      "path": "wiki/重点代码.md",
+      "sha256": "0e15bc573676e4f476f09db805d9dfbeab20fcb73637657a6b5f01ea36403054",
+      "mode": "100644"
+    }
+  ]
+}
