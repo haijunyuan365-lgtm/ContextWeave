@@ -162,3 +162,24 @@ async def test_failed_startup_closes_initialized_services_even_if_one_close_fail
     pipeline.close.assert_awaited_once()
     memory.close.assert_awaited_once()
     assert not main._ready and main._memory is None
+
+
+@pytest.mark.asyncio
+async def test_partial_agent_result_stays_degraded_and_matches_legacy_success_count():
+    from agents.agent_orchestrator import Request, AgentType
+    from observability.bootstrap import get_provider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    exporter = InMemorySpanExporter()
+    get_provider().add_span_processor(SimpleSpanProcessor(exporter))
+    orch = AgentOrchestrator("test-key", model="test")
+    agent = orch._pool[AgentType.GENERAL][0]
+    agent._client = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(return_value=
+        SimpleNamespace(content=[{"type":"text", "text":"unfinished"}], stop_reason="max_tokens"))))
+    result = await orch.run(Request("hello", "u", "c", intent=IntentCategory.GREETING))
+    assert result.status == "partial" and agent.stats.success == 0
+    spans = [span for span in exporter.get_finished_spans() if span.attributes.get("app.request_id") == result.request_id]
+    execution = next(span for span in spans if span.name == "agent.execute")
+    assert execution.attributes["app.agent.success"] is False
+    assert execution.attributes["app.outcome"] == "degraded"
+    assert next(span for span in spans if span.name == "agent.orchestrate").attributes["app.outcome"] == "degraded"

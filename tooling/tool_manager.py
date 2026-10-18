@@ -224,6 +224,8 @@ class MCPToolManager:
         try:
             self._validate_params(tool, params)
         except ValueError as ex:
+            annotate(**{"app.tool.success": False, "app.tool.result_success": False})
+            outcome("error", code="INVALID_TOOL_ARGUMENTS")
             # 用户参数错误不应使健康的外部服务被熔断。
             return ToolResult(success=False, data=None, tool_name=name, error=str(ex))
         cache_version = self._cache_versions.get(name, 0)

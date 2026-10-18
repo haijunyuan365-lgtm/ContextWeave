@@ -1,0 +1,20 @@
+{
+  "status": "passed",
+  "counts": {
+    "documents": 15,
+    "local_links": 281,
+    "anchor_links": 143,
+    "shell_blocks": 47,
+    "python_programs": 9,
+    "json_blocks": 34,
+    "test_selectors": 6,
+    "offline_experiments": 3
+  },
+  "errors": [],
+  "python": "3.10.9",
+  "platform": "Windows",
+  "git_head": "9b2c7277e670164194f6524c4aac6a2c7b2dc7a0",
+  "source_sha256": "e547d639e2fb3c53cb628604a98bc5fbfc895c1e8dd9a9d6647884f7b9a25f9f",
+  "tutorial_sha256": "9006e586bccdfff018b7c8a918e5ab75cb216fc0d3083d82892fb787b1ed6210",
+  "limits": "仅本地链接/锚点、Shell/JSON/完整Python语法、测试名称与可选三项离线实验；未运行在线服务或完整pytest。"
+}

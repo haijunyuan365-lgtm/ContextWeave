@@ -909,7 +909,9 @@ class AgentOrchestrator:
             span.set_attribute("app.agent.name", result.agent_type.value)
             span.set_attribute("app.agent.multi_agent", len(result.agent_types) > 1)
             span.set_attribute("app.agent.escalated", result.escalated)
-            if req.execution_records and not any(r["success"] for r in req.execution_records):
+            if result.status == "partial":
+                set_outcome(span, "degraded")
+            elif req.execution_records and not any(r["success"] for r in req.execution_records):
                 set_outcome(span, "error", code="AGENT_FAILED")
             elif any(not record["success"] or record["fallback"] for record in req.execution_records):
                 set_outcome(span, "degraded", fallback=any(r["fallback"] for r in req.execution_records))
@@ -998,7 +1000,9 @@ class AgentOrchestrator:
             span.set_attribute("app.agent.multi_agent", True)
             span.set_attribute("app.agent.name", result.agent_type.value)
             span.set_attribute("app.agent.escalated", result.escalated)
-            if req.execution_records and not any(r["success"] for r in req.execution_records):
+            if result.status == "partial":
+                set_outcome(span, "degraded")
+            elif req.execution_records and not any(r["success"] for r in req.execution_records):
                 set_outcome(span, "error", code="AGENT_FAILED")
             elif any(not r["success"] or r["fallback"] for r in req.execution_records):
                 set_outcome(span, "degraded", fallback=any(r["fallback"] for r in req.execution_records))
@@ -1296,12 +1300,12 @@ class AgentOrchestrator:
             except BaseException:
                 req.execution_records.append({"agent_type": agent.agent_type.value, "success": False, "fallback": fallback})
                 raise
-            span.set_attribute("app.agent.success", response.success)
+            span.set_attribute("app.agent.success", response.success and response.status == "success")
             span.set_attribute("app.agent.escalated", response.escalate)
             if not response.success:
                 set_outcome(span, "error", fallback=fallback, code="AGENT_FAILED")
-            elif fallback:
-                set_outcome(span, "degraded", fallback=True)
+            elif fallback or response.status == "partial":
+                set_outcome(span, "degraded", fallback=fallback)
             req.execution_records.append({"agent_type": response.agent_type.value,
                 "success": response.success, "fallback": fallback})
             return response

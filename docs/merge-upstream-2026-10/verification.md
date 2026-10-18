@@ -33,3 +33,22 @@
 - 72 个 Python 模块 AST；pip check 通过。
 - 两组 Compose config --quiet 均通过；不是部署验收。
 - Docker info：HTTP 500；本机 Redis/Chroma/OTLP/Prometheus/Grafana 端口不可用。
+
+## M5 最终结果 — 2026-10-18T18:16:51+08:00
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| 完整联合 pytest | 392 passed, 1 warning in 19.45s |
+| 新增跨分支回归 | 8 项通过 |
+| Python AST | 74 个已跟踪文件通过 |
+| pip check | No broken requirements found |
+| 教程及三项离线实验 | 全部通过 |
+| README/Wiki 本地文件链接 | 无失效文件链接 |
+| Compose 主服务+观测+看板 / Web 叠加 | config --quiet 通过 |
+| 冲突标记及空白 | 无冲突，git diff --check 通过 |
+| 附件 SHA/113 文件哈希 | 与 M0 一致 |
+| 凭据和运行数据边界 | 无禁止文件被跟踪；凭据模式无命中 |
+| 真实服务联调 | 未通过验收：Docker Engine HTTP 500，依赖端口不可用 |
+| 真实模型/在线向量/远程 MCP | 未运行，不声称连通或业务准确率 |
+
+唯一 pytest warning 来自 Starlette 测试客户端的 AnyIO 别名弃用提示。最终模型请求由 fake client 响应；本轮没有配置新密钥或调用真实计费模型。
