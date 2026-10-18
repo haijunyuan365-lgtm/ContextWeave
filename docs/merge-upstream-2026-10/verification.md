@@ -52,3 +52,7 @@
 | 真实模型/在线向量/远程 MCP | 未运行，不声称连通或业务准确率 |
 
 唯一 pytest warning 来自 Starlette 测试客户端的 AnyIO 别名弃用提示。最终模型请求由 fake client 响应；本轮没有配置新密钥或调用真实计费模型。
+
+## GitHub 交付 — 2026-10-18T18:18:05+08:00
+
+发布提交 affc99fd4c04751f32dc146b04db649a8c75f945 已推送 origin/trace，ls-remote 同 SHA。GitHub 返回仓库迁移提示：当前为 haijunyuan365-lgtm/ContextWeave。日志收尾提交也同步 trace，最终 SHA 在最终答复提供。
