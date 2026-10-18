@@ -4,9 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from api import main
-from mcp.knowledge_base import KnowledgeBase
-from mcp.rag_config import RAGConfig
-from mcp.tool_manager import MCPToolManager, Tool, ToolResult
+from tooling.knowledge_base import KnowledgeBase
+from tooling.rag_config import RAGConfig
+from tooling.tool_manager import MCPToolManager, Tool, ToolResult
 
 
 class FakeCollection:

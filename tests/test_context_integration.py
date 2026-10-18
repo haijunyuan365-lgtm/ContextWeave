@@ -12,7 +12,7 @@ from core.context_planner import ContextPlanner, ContextPlan, LightweightContext
 from core.context_runtime import ContextPipeline
 from core.intent_recognizer import IntentCategory, IntentResult, UrgencyLevel
 from memory.conversation_memory import MemoryManager
-from mcp.tool_manager import MCPToolManager, ToolResult
+from tooling.tool_manager import MCPToolManager, ToolResult
 
 
 def test_lightweight_memory_reads_only_five_messages_and_summary():

@@ -321,7 +321,7 @@ def test_malformed_snapshot_reference_and_old_source_id_do_not_break_business(ba
 
 
 def test_actual_mmr_and_rerank_fallbacks_keep_input_and_output_snapshots(backend):
-    from mcp.tool_manager import MCPToolManager
+    from tooling.tool_manager import MCPToolManager
     manager = MCPToolManager("test-key", model="test-model")
     manager._client = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(side_effect=TimeoutError())))
     items = [{"chunk_id":"a","score":.5,"content":"PRIVATE"}, {"chunk_id":"b","score":.4,"content":"PRIVATE"}]

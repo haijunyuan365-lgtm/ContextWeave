@@ -24,7 +24,7 @@ from agents.agent_orchestrator import AgentOrchestrator, AgentType, Request
 from core.context_planner import ContextPlanner, LightweightContext
 from core.context_runtime import ContextPipeline
 from core.intent_recognizer import IntentCategory, IntentResult, UrgencyLevel
-from mcp.tool_manager import MCPToolManager, Tool, CircuitState
+from tooling.tool_manager import MCPToolManager, Tool, CircuitState
 from monitor.performance_monitor import PerformanceMonitor
 from observability import bootstrap, observed, request_context
 from observability.bootstrap import SafeSpanExporter

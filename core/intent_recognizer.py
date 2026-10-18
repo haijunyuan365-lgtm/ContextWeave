@@ -10,9 +10,11 @@
 LLM 和 Embedding 并行调用，不串行等待。
 """
 import asyncio
+import math
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -68,6 +70,7 @@ class IntentResult:
     reasoning:  str
     latency_ms: float
     source_scores: Dict[str, float] = field(default_factory=dict)
+    embedding_source: str = "local-ngram"
 
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
@@ -161,12 +164,11 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        # 本地字符 n-gram 向量始终可用；如果未来客户端暴露 embeddings 资源，
-        # _embed_text 会优先尝试远端向量，否则自动回退本地向量。
+        from core.intent_embedding import IntentEmbedding
+        self._embedding = IntentEmbedding()
         self._embedding_enabled = True
-
-        self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
+        self._cache_expiries: Dict[str, float] = {}
         self.cache_hits   = 0
         self.cache_misses = 0
 
@@ -185,7 +187,7 @@ class IntentRecognizer:
         history 格式：[{"role": "user"/"assistant", "content": "..."}]
         """
         key = self._cache_key(message, history, summary)
-        if key in self._cache:
+        if key in self._cache and time.monotonic() < self._cache_expiries.get(key, 0):
             self.cache_hits += 1
             annotate(**{"app.cache_hit": True})
             annotate(**{"app.intent.name": self._cache[key].intent.value, "app.intent.confidence": self._cache[key].confidence})
@@ -223,13 +225,16 @@ class IntentRecognizer:
             reasoning=llm.get("reasoning", ""),
             latency_ms=(time.monotonic() - t0) * 1000,
             source_scores=source_scores,
+            embedding_source=emb.get("source", "local-ngram"),
         )
 
         # LRU 缓存
         if len(self._cache) >= 1000:
             for k in list(self._cache)[:500]:
                 del self._cache[k]
+                self._cache_expiries.pop(k, None)
         self._cache[key] = result
+        self._cache_expiries[key] = time.monotonic() + (60 if result.embedding_source == "local-ngram" and self._embedding.enabled else 300)
         return result
 
     def learn(self, message: str, correct: IntentCategory) -> None:
@@ -237,8 +242,10 @@ class IntentRecognizer:
         tpls = _TEMPLATES.setdefault(correct, [])
         if message not in tpls:
             tpls.append(message)
-            self._tpl_embeddings.pop(correct, None)  # 下次重新计算
+            self._embedding.remote_templates.clear()
+            self._embedding.local_templates.clear()
             self._cache.clear()  # 模板更新后旧缓存可能对应过时结果
+            self._cache_expiries.clear()
             logger.info(f"学习新样本 → {correct.value}: {message[:40]}")
 
     # ── 三路识别策略 ──────────────────────────────────────────────────────────
@@ -270,6 +277,9 @@ class IntentRecognizer:
 如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
 例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
 
+示例:
+{examples}
+
         {ctx}
         用户消息: "{message}"
 
@@ -280,12 +290,12 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await generate(self.client, stage="intent",
+            resp = await asyncio.wait_for(generate(self.client, stage="intent",
                 model=self.model,
                 max_tokens=256,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
-            )
+            ), timeout=max(0.1, float(os.getenv("ECHOMIND_INTENT_TIMEOUT_S", "8"))))
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
@@ -293,6 +303,9 @@ class IntentRecognizer:
                 data["intent"] = IntentCategory(data["intent"])
             except ValueError:
                 data["intent"] = IntentCategory.OTHER
+            confidence = data.get("confidence")
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise ValueError("意图 confidence 必须是 0 到 1 的有限数字")
             annotate(**{"app.intent.name": data["intent"].value, "app.intent.confidence": data.get("confidence", 0.0)})
             return data
         except Exception as ex:
@@ -304,17 +317,17 @@ class IntentRecognizer:
     async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
         """策略 2：Embedding 向量相似度匹配。"""
         try:
-            await self._load_template_embeddings()
-            msg_vec = await self._embed_text(message)
+            templates, msg_vec, source = await self._embedding.vectors(
+                self._clean_text(message), _TEMPLATES, self._local_embedding)
 
             best_cat, best_score = IntentCategory.OTHER, 0.0
-            for cat, vecs in self._tpl_embeddings.items():
+            for cat, vecs in templates.items():
                 score = max(_cosine(msg_vec, v) for v in vecs)
                 if score > best_score:
                     best_score, best_cat = score, cat
 
             annotate(**{"app.intent.name": best_cat.value, "app.intent.confidence": best_score})
-            return {"intent": best_cat, "confidence": best_score}
+            return {"intent": best_cat, "confidence": min(1.0, max(0.0, best_score)), "source": source}
         except Exception as ex:
             outcome("degraded", fallback=True, code="TIMEOUT" if error_code(ex) == "TIMEOUT" else "INTENT_EMBEDDING_FAILED")
             logger.warning(f"Embedding 识别失败: {ex}")
@@ -359,6 +372,13 @@ class IntentRecognizer:
 
     def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> tuple[IntentCategory, float, Dict[str, float]]:
         """加权投票。返回最终意图、融合置信度和各路来源得分。"""
+        cleaned = []
+        for source in (llm, emb, pat):
+            value = source.get("confidence")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                source = {"intent": IntentCategory.OTHER, "confidence": 0.0, "failed": True}
+            cleaned.append(source)
+        llm, emb, pat = cleaned
         source_scores = {
             "llm": float(llm.get("confidence", 0.0) or 0.0),
             "embedding": float(emb.get("confidence", 0.0) or 0.0),
@@ -376,16 +396,26 @@ class IntentRecognizer:
         else:
             weights = [(llm, 0.85), (pat, 0.15)]
         scores: Dict[IntentCategory, float] = {}
+        group_scores: Dict[IntentCategory, float] = {}
         for result, w in weights:
             cat  = result.get("intent", IntentCategory.OTHER)
             conf = result.get("confidence", 0.0)
-            scores[cat] = scores.get(cat, 0.0) + w * conf
+            weighted_score = w * conf
+            scores[cat] = scores.get(cat, 0.0) + weighted_score
+            group = _INTENT_GROUPS.get(cat, cat)
+            group_scores[group] = group_scores.get(group, 0.0) + weighted_score
 
-        best = max(scores, key=scores.get)  # type: ignore
-        best_score = scores[best]
+        best_group = max(group_scores, key=group_scores.get)
+        best_score = group_scores[best_group]
+        best = max(
+            (cat for cat in scores if _INTENT_GROUPS.get(cat, cat) == best_group),
+            key=scores.get,
+        )
         pat_intent = pat.get("intent", IntentCategory.OTHER)
         pat_conf = float(pat.get("confidence", 0.0) or 0.0)
-        if best in _GENERIC_INTENTS and pat_intent in _SPECIFIC_INTENTS and pat_conf >= 0.5 and best_score < 0.8:
+        if (best in _GENERIC_INTENTS and pat_intent in _SPECIFIC_INTENTS
+                and _INTENT_GROUPS.get(pat_intent, pat_intent) == best_group
+                and pat_conf >= 0.5 and best_score < 0.8):
             source_scores["refined_by_pattern"] = pat_conf
             return pat_intent, max(best_score, pat_conf), source_scores
         if best_score < self.threshold:
@@ -410,40 +440,6 @@ class IntentRecognizer:
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
-    async def _load_template_embeddings(self) -> None:
-        """懒加载所有模板的 Embedding（只在首次调用时执行）。"""
-        missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
-        if not missing:
-            return
-
-        all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
-        vecs = [await self._embed_text(text) for text in all_texts]
-        idx = 0
-        for cat in missing:
-            n = len(_TEMPLATES[cat])
-            self._tpl_embeddings[cat] = vecs[idx: idx + n]
-            idx += n
-
-    async def _embed_text(self, text: str) -> List[float]:
-        """
-        生成文本向量。
-
-        如果未来接入的官方/兼容客户端提供 embeddings.create，会优先使用远端向量；
-        当前 Anthropic SDK 没有该资源时，退化为字符 n-gram 哈希向量。这样不会因为
-        Embedding 服务缺失导致三路融合中断。
-        """
-        embeddings = getattr(self.client, "embeddings", None)
-        annotate(**{"app.embedding.mode": "remote" if embeddings is not None else "local"})
-        if embeddings is not None:
-            try:
-                resp = await embeddings.create(model="voyage-3-lite", input=[text])
-                return list(resp.data[0].embedding)
-            except Exception as ex:
-                outcome("degraded", fallback=True, code="REMOTE_EMBEDDING_FAILED")
-                logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
-
-        return self._local_embedding(text)
-
     @staticmethod
     def _local_embedding(text: str, dims: int = 256) -> List[float]:
         """稳定的字符 n-gram 哈希向量，用于无远端 Embedding 时的语义近似匹配。"""
@@ -465,8 +461,10 @@ class IntentRecognizer:
 
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()
+        msg = re.sub(r"(?:不(?:是|用|需要)?|无需|无须|非|并不|没那么|暂不)\s*(?:紧急|立刻|马上|尽快|快点)", "", msg)
+        msg = re.sub(r"\b(?:not|isn't|is not|no)\s+(?:an?\s+)?(?:emergency|urgent|asap|now)\b", "", msg)
         for level, kws in _URGENCY_KEYWORDS.items():
-            if any(kw in msg for kw in kws):
+            if any(re.search(rf"(?<![a-z]){re.escape(kw)}(?![a-z])", msg) if kw.isascii() else kw in msg for kw in kws):
                 return level
         if intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
             return UrgencyLevel.HIGH

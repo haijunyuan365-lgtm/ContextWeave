@@ -20,14 +20,14 @@ import logging
 import math
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content
-from mcp.rag_config import RAGConfig
+from tooling.rag_config import RAGConfig
 from observability.llm import generate
 from observability import observed, set_outcome
 from observability.instrumentation import instrumented, annotate, outcome
@@ -154,6 +154,19 @@ class MCPToolManager:
         self.rag_config = rag_config or RAGConfig.from_env()
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
+
+    def fork(self):
+        """Share dependencies while isolating evaluation cache, breakers and metrics."""
+        other = object.__new__(type(self))
+        other._client, other._model = self._client, self._model
+        other.rag_config = self.rag_config
+        other._metrics_owner = uuid.uuid4().hex
+        other._cache = {}
+        other._tools = {name: replace(tool) for name, tool in self._tools.items()}
+        return other
+
+    def invalidate_cache(self, name=None):
+        self.clear_cache(name)
 
     # ── 注册 / 注销 ───────────────────────────────────────────────────────────
 

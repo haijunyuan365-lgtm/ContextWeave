@@ -16,9 +16,9 @@ from agents.tools import make_tool
 from core.context_runtime import ContextBundle, RetrievalSession
 from core.intent_recognizer import IntentRecognizer, IntentCategory, UrgencyLevel
 from core.context_planner import ContextPlanner, LightweightContext
-from mcp.knowledge_base import KnowledgeBase
-from mcp.rag_config import RAGConfig
-from mcp.tool_manager import MCPToolManager, Tool, CircuitState
+from tooling.knowledge_base import KnowledgeBase
+from tooling.rag_config import RAGConfig
+from tooling.tool_manager import MCPToolManager, Tool, CircuitState
 from observability import observed, request_context, correlation_ids
 from observability.bootstrap import get_provider, SafeSpanExporter
 from observability.llm import generate
@@ -358,7 +358,7 @@ def test_planner_timeout_is_distinct_from_llm_task_cancellation(spans):
 def test_every_existing_model_call_uses_the_shared_wrapper():
     root = Path(__file__).resolve().parents[1]
     stages = set()
-    for directory in ("agents", "core", "memory", "evaluation", "mcp"):
+    for directory in ("agents", "core", "memory", "evaluation", "tooling"):
         for path in (root / directory).glob("*.py"):
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.Call):
@@ -515,3 +515,4 @@ def test_experience_judge_usage_is_in_worker_trace_and_retries_use_new_traces(sp
     assert {s.parent.span_id for s in calls} == {s.context.span_id for s in workers}
     assert calls[1].attributes["gen_ai.usage.input_tokens"] == 80
     assert calls[1].attributes["app.operation"] == "experience"
+

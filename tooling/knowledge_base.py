@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 import jieba
 from rank_bm25 import BM25Okapi
 
-from mcp.rag_config import RAGConfig
+from tooling.rag_config import RAGConfig
 from observability import observed
 from observability.instrumentation import instrumented, annotate, outcome
 from observability.rag_snapshot import candidates

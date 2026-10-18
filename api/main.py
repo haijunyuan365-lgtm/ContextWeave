@@ -101,8 +101,8 @@ async def _service_lifespan(app: FastAPI):
     from agents.agent_orchestrator import AgentOrchestrator, Request, build_shared_rag_tools
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
+    from tooling.knowledge_base import KnowledgeBase
+    from tooling.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
@@ -145,7 +145,7 @@ async def _service_lifespan(app: FastAPI):
     )
 
     # MCP 工具管理器 + RAG 知识库（Chroma Vector + 进程内 BM25）
-    from mcp.rag_config import RAGConfig
+    from tooling.rag_config import RAGConfig
     rag_config = RAGConfig.from_env()
     _tool_manager = MCPToolManager(
         api_key=cfg["api_key"],
