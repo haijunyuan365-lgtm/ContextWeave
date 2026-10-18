@@ -280,10 +280,12 @@ class ContextPipeline:
             raise
 
     async def close(self) -> None:
-        if self.experience is not None:
-            await self.experience.close()
-        if self.planner.client is not None:
-            await self.planner.client.close()
+        try:
+            if self.experience is not None:
+                await self.experience.close()
+        finally:
+            if self.planner.client is not None:
+                await self.planner.client.close()
 
     async def capture(self, req: Any, result: Any) -> None:
         with observed("experience.submit", span_type="experience") as span:

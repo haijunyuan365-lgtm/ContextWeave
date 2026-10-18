@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: echomind
+    environment: production
+
+rule_files:
+  - "alerts/*.yml"
+
+scrape_configs:
+  - job_name: echomind-app
+    static_configs:
+      - targets: ["echomind:8000"]
+        labels:
+          service: echomind
+    scrape_interval: 10s
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/echomind_metrics_token
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

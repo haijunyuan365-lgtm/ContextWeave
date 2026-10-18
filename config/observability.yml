@@ -1,4 +1,4 @@
-# 本地历史需显式启用；访问接口还需 TRACE_ADMIN_TOKEN 环境变量。
+# 本地历史需显式启用；访问接口还需 API admin 身份或 TRACE_ADMIN_TOKEN。
 history:
   enabled: false
   path: data/observability/traces.sqlite3

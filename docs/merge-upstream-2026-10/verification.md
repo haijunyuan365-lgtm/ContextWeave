@@ -25,3 +25,11 @@
 ## M3
 
 完整联合回归：389 passed, 1 warning in 20.01s。包含五项新增跨分支回归。标准 MCP 使用本地 SDK fixture 服务；fakeredis 是协议模拟，不代表真实 Redis/Chroma 部署验收。
+
+## M4
+
+- 391 passed, 1 warning in 19.78s。
+- 教程检查 --run-offline：15 篇 / 281 文件链接 / 143 锚点 / 47 Shell / 9 Python / 34 JSON / 6 选择器 / 3 实验全部通过。
+- 72 个 Python 模块 AST；pip check 通过。
+- 两组 Compose config --quiet 均通过；不是部署验收。
+- Docker info：HTTP 500；本机 Redis/Chroma/OTLP/Prometheus/Grafana 端口不可用。

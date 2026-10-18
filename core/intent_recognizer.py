@@ -320,6 +320,9 @@ class IntentRecognizer:
             templates, msg_vec, source = await self._embedding.vectors(
                 self._clean_text(message), _TEMPLATES, self._local_embedding)
 
+            annotate(**{"app.embedding.source": source, "app.embedding.mode": "remote" if source.startswith("siliconflow/") else "local"})
+            if self._embedding.enabled and source == "local-ngram":
+                outcome("degraded", fallback=True, code="REMOTE_EMBEDDING_UNAVAILABLE")
             best_cat, best_score = IntentCategory.OTHER, 0.0
             for cat, vecs in templates.items():
                 score = max(_cosine(msg_vec, v) for v in vecs)

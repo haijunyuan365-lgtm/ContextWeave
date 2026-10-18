@@ -119,3 +119,46 @@ def test_history_accepts_api_admin_or_dedicated_trace_token(monkeypatch):
     assert client.get("/trace/history", headers={"Authorization":"Bearer " + user}).status_code == 403
     assert client.get("/memory/u", headers={"Authorization":"Bearer " + trace}).status_code == 401
 
+
+
+def test_readiness_requires_full_pipeline_and_live_storage(monkeypatch):
+    monkeypatch.delenv("ECHOMIND_API_TOKENS", raising=False)
+    monkeypatch.setenv("ECHOMIND_ENV", "development")
+    monkeypatch.setattr(main, "_ready", True)
+    mem = SimpleNamespace(_redis=SimpleNamespace(ping=AsyncMock(return_value=True)),
+                          _chroma=SimpleNamespace(heartbeat=Mock(return_value=1)))
+    for name in ["_orchestrator", "_tool_manager", "_monitor", "_evaluator", "_context_pipeline"]:
+        monkeypatch.setattr(main, name, object())
+    monkeypatch.setattr(main, "_memory", mem)
+    client = TestClient(main.app)
+    assert client.get("/health").status_code == 200
+    mem._redis.ping.side_effect = ConnectionError("private address")
+    assert client.get("/health").status_code == 503
+    mem._redis.ping.side_effect = None
+    monkeypatch.setattr(main, "_context_pipeline", None)
+    assert client.get("/health").status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_closes_initialized_services_even_if_one_close_fails(monkeypatch):
+    from contextlib import asynccontextmanager
+    monitor = SimpleNamespace(stop=AsyncMock(side_effect=RuntimeError("stop failed")))
+    memory = SimpleNamespace(close=AsyncMock())
+    pipeline = SimpleNamespace(close=AsyncMock())
+    for name, value in [("_monitor", monitor), ("_memory", memory), ("_context_pipeline", pipeline),
+                        ("_mcp_client", None), ("_profile_updater", None), ("_orchestrator", None),
+                        ("_eval_orchestrator", None), ("_tool_manager", None), ("_evaluator", None), ("_ready", False)]:
+        monkeypatch.setattr(main, name, value)
+    @asynccontextmanager
+    async def partial_start(app):
+        raise RuntimeError("startup failed")
+        yield
+    monkeypatch.setattr(main, "_service_lifespan", partial_start)
+    monkeypatch.setattr(main, "shutdown_tracing", Mock())
+    with pytest.raises(RuntimeError, match="startup failed"):
+        async with main.lifespan(main.app):
+            pass
+    monitor.stop.assert_awaited_once()
+    pipeline.close.assert_awaited_once()
+    memory.close.assert_awaited_once()
+    assert not main._ready and main._memory is None

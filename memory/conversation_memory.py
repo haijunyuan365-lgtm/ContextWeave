@@ -600,9 +600,13 @@ class MemoryManager:
 
     async def close(self) -> None:
         """关闭异步 Redis 连接。"""
-        await self._evolution.close()
-        await self._client.close()
-        await self._redis.aclose()
+        try:
+            await self._evolution.close()
+        finally:
+            try:
+                await self._client.close()
+            finally:
+                await self._redis.aclose()
 
     @classmethod
     def _wm_key(cls, user_id: str, conv_id: str) -> str:

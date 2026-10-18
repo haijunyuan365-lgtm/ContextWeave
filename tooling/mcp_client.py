@@ -19,6 +19,7 @@ from mcp.types import Implementation
 from mcp.client.streamable_http import streamable_http_client
 
 from agents.tools import AgentToolSpec
+from observability.instrumentation import instrumented, annotate
 from tooling.tool_manager import MCPToolManager, Tool
 
 logger = logging.getLogger(__name__)
@@ -277,7 +278,9 @@ class StandardMCPClient:
         if self._on_change:
             self._on_change()
 
+    @instrumented("mcp.remote.call", span_type="tool")
     async def _call_remote(self, server, name, arguments):
+        annotate(**{"app.mcp.server": server, "app.mcp.tool": name})
         connection = self.connections[server]
         if connection.session is None:
             raise MCPRemoteError(f"MCP 服务 {server} 未连接")

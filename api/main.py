@@ -38,8 +38,9 @@ load_dotenv()
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s request_id=%(request_id)s trace_id=%(trace_id)s span_id=%(span_id)s: %(message)s",
 )
+configure_logging()
 logger = logging.getLogger(__name__)
 
 BANNER = r"""
@@ -57,10 +58,12 @@ _memory       = None
 _tool_manager = None
 _monitor      = None
 _evaluator    = None
+_evaluation_recognizer = None
 _eval_orchestrator = None
 _eval_tool_manager = None
 _skill_manager = None
 _context_pipeline = None
+_ready = False
 _profile_updater = None
 _mcp_client = None
 from evaluation.jobs import EvaluationJobs
@@ -90,7 +93,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def _service_lifespan(app: FastAPI):
-    global _context_pipeline, _eval_orchestrator, _eval_tool_manager, _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _profile_updater, _mcp_client
+    global _evaluation_recognizer, _ready, _context_pipeline, _eval_orchestrator, _eval_tool_manager, _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _profile_updater, _mcp_client
 
     from core.access import identity
     identity("")  # 启动时验证生产鉴权配置
@@ -115,6 +118,8 @@ async def _service_lifespan(app: FastAPI):
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
+
+    _evaluation_recognizer = recognizer
 
     # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
     skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
@@ -229,6 +234,7 @@ async def _service_lifespan(app: FastAPI):
     _profile_updater.start()
     logger.info("EchoMind 已就绪")
     async with standard_mcp_server.session_manager.run():
+        _ready = True
         yield
 
 
@@ -245,8 +251,9 @@ async def lifespan(app: FastAPI):
 
 async def _close_services():
     """Clean every successfully initialized component, including failed startup."""
-    global _context_pipeline, _profile_updater, _mcp_client, _monitor, _memory
+    global _evaluation_recognizer, _ready, _context_pipeline, _profile_updater, _mcp_client, _monitor, _memory
     global _orchestrator, _tool_manager, _evaluator, _eval_orchestrator, _eval_tool_manager
+    _ready = False
     for obj, operation in [(_eval_jobs, "close"), (_profile_updater, "close"), (_mcp_client, "close"),
                            (_monitor, "stop"), (_context_pipeline, "close"), (_memory, "close")]:
         if obj is not None:
@@ -254,10 +261,26 @@ async def _close_services():
                 await getattr(obj, operation)()
             except Exception as exc:
                 logger.warning("shutdown_failed component=%s error=%s", type(obj).__name__, type(exc).__name__)
+    clients = [getattr(_evaluation_recognizer, "client", None)]
+    for orch in (_orchestrator, _eval_orchestrator):
+        if orch is not None:
+            clients.extend([getattr(getattr(orch, "_composer", None), "_client", None),
+                            getattr(getattr(orch, "_intent_recognizer", None), "client", None)])
+    clients.extend([getattr(_tool_manager, "_client", None),
+                    getattr(getattr(_evaluator, "_judge", None), "_client", None),
+                    getattr(getattr(getattr(_evaluator, "_intent_evaluator", None), "_recognizer", None), "client", None)])
+    seen = set()
+    for client in clients:
+        if client is not None and id(client) not in seen:
+            seen.add(id(client))
+            try:
+                await client.close()
+            except Exception as exc:
+                logger.warning("client_close_failed error=%s", type(exc).__name__)
     from tooling.mcp_server import configure
     configure(None)
     _context_pipeline = _profile_updater = _mcp_client = _monitor = _memory = None
-    _orchestrator = _tool_manager = _evaluator = _eval_orchestrator = _eval_tool_manager = None
+    _orchestrator = _tool_manager = _evaluator = _eval_orchestrator = _eval_tool_manager = _evaluation_recognizer = None
 
 
 def _refresh_agent_tools():
@@ -392,9 +415,15 @@ class RecentToolTracesResponse(BaseModel):
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    if _orchestrator is None:
+    if not _ready or any(component is None for component in
+            (_orchestrator, _memory, _tool_manager, _context_pipeline, _monitor, _evaluator)):
         raise HTTPException(503, "服务未就绪")
-    return {"status": "ok", "agents": {} if os.getenv("ECHOMIND_API_TOKENS") else _orchestrator.get_stats()}
+    try:
+        await asyncio.wait_for(_memory._redis.ping(), 2)
+        await asyncio.wait_for(asyncio.to_thread(_memory._chroma.heartbeat), 2)
+    except Exception:
+        raise HTTPException(503, "存储依赖未就绪") from None
+    return {"status": "ok"}
 
 
 @app.get("/skills", tags=["Skills"])

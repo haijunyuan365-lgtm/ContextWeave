@@ -35,3 +35,6 @@ build-image*.sh
 *~
 *.bak
 docker-compose(1).yml
+
+# Versioned deployment helper; generated build-image variants remain ignored.
+!build-image.sh
