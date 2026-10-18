@@ -21,3 +21,7 @@
 - 核心选择集：157 passed / 1 failed / 2 deselected；修复旧 mock 的 get_trace 协议后针对失败项 1 passed。
 - 测试覆盖真实本地 MCP stdio 往返（fixture 服务）、fakeredis 锁/事务/回执和原有 Context/Memory/Trace。
 - 两项异步评测/监控检查留待 M3，不宣称全量通过。
+
+## M3
+
+完整联合回归：389 passed, 1 warning in 20.01s。包含五项新增跨分支回归。标准 MCP 使用本地 SDK fixture 服务；fakeredis 是协议模拟，不代表真实 Redis/Chroma 部署验收。

@@ -37,5 +37,7 @@ def ranked(function):
     async def wrapped(*args, **kwargs):
         items = signature.bind(*args, **kwargs).arguments.get("items", [])
         candidates(items, "input")
-        return candidates(await function(*args, **kwargs))
+        result = await function(*args, **kwargs)
+        candidates(result[0] if isinstance(result, tuple) else result)
+        return result
     return wrapped

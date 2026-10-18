@@ -1,3 +1,4 @@
+from memory_fakes import atomic_http_stub
 """P2: exact per-completion metrics, legacy reconciliation and real loopback OTLP IO."""
 import asyncio
 from contextlib import contextmanager
@@ -124,7 +125,8 @@ def test_monitor_repeated_collection_does_not_observe_more_histogram_samples(met
 def test_monitor_modes_preserve_routing_penalties(metrics, mode, selected):
     orch, manager = services()
     orch._pool[AgentType.GENERAL][0]._client.messages.create.side_effect = RuntimeError("private failure")
-    asyncio.run(orch.run(Request("hello", "u", "c", intent=IntentCategory.GREETING)))
+    for _ in range(5):
+        asyncio.run(orch.run(Request("hello", "u", "c", intent=IntentCategory.GREETING)))
     monitor = PerformanceMonitor(orch, manager, metrics_projection=metrics.projection, stats_source=mode)
     old = orch.get_stats()["general_0"]
     asyncio.run(monitor._collect())
@@ -138,6 +140,8 @@ def test_reconciliation_mismatch_falls_back_without_changing_route_feedback(metr
     orch._pool[AgentType.GENERAL][0].stats.total = 20
     orch._pool[AgentType.GENERAL][0].stats.success = 10
     orch._pool[AgentType.GENERAL][0].stats.total_ms = 100_000
+    import time
+    orch._pool[AgentType.GENERAL][0].stats.samples.extend((time.monotonic(), i < 10, 5000) for i in range(20))
     monitor = PerformanceMonitor(orch, manager, metrics_projection=metrics.projection)
     asyncio.run(monitor._collect())
     report = monitor.summary()["stats_reconciliation"]["agent"]["general_0"]
@@ -350,6 +354,7 @@ def test_default_metrics_endpoint_and_legacy_monitor_tool_trace_api(metrics, mon
     orch, manager = services()
     orch.recognize_intent = AsyncMock(return_value=IntentResult(IntentCategory.GREETING, .99, UrgencyLevel.LOW, "other", {}, "", 0))
     memory = SimpleNamespace(begin_turn=AsyncMock(), add_message=AsyncMock(), get_lightweight_context=AsyncMock(return_value=LightweightContext()))
+    memory = atomic_http_stub(memory)
     pipeline = ContextPipeline(orch, ContextPlanner(None, "test"), memory)
     monitor = PerformanceMonitor(orch, manager, metrics_projection=metrics.projection)
     for name, value in (("_orchestrator", orch), ("_tool_manager", manager), ("_memory", memory), ("_context_pipeline", pipeline), ("_monitor", monitor)):
@@ -403,11 +408,16 @@ def test_metrics_survive_invalid_trace_export_configuration(metrics, monkeypatch
 
 def test_registered_metric_families_are_reused_when_monitors_share_registry(metrics, monkeypatch):
     orch, manager = services()
-    listener = Mock()
+    listener = Mock(return_value=(Mock(), None))
     monkeypatch.setattr("monitor.performance_monitor.start_http_server", listener)
     one = PerformanceMonitor(orch, manager, metrics_projection=metrics.projection, prometheus_port=9999)
     two = PerformanceMonitor(orch, manager, metrics_projection=metrics.projection)
-    listener.assert_called_once_with(9999)
+    listener.assert_not_called()
+    async def lifecycle():
+        await one.start()
+        await one.stop()
+    asyncio.run(lifecycle())
+    listener.assert_called_once_with(9999, registry=metrics.registry)
     assert one._prom["requests_total"] is two._prom["requests_total"]
     assert one.summary()["stats_reconciliation"]["capture_available"]
 

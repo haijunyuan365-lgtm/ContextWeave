@@ -7,17 +7,19 @@ import re
 import sqlite3
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from observability.history import get_history
 
 
-def authorized_history(authorization: Optional[str] = Header(default=None)):
+def authorized_history(request: Request, authorization: Optional[str] = Header(default=None)):
     token = os.getenv("TRACE_ADMIN_TOKEN", "").strip()
-    if not token:
+    account = getattr(request.state, "account", None)
+    admin = bool(account and account.get("role") == "admin")
+    if not token and not admin:
         raise HTTPException(503, "历史追踪接口未配置访问令牌")
     expected = ("Bearer " + token).encode("utf-8")
-    if not hmac.compare_digest((authorization or "").encode("utf-8"), expected):
+    if not admin and not hmac.compare_digest((authorization or "").encode("utf-8"), expected):
         raise HTTPException(401, "追踪访问令牌无效", headers={"WWW-Authenticate": "Bearer"})
     store = get_history()
     if store is None:

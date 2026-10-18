@@ -129,7 +129,9 @@ class MemoryManager:
             )
             chroma.heartbeat()  # 测试连接
             logger.info(f"ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
+        except Exception as ex:
+            if os.getenv("ECHOMIND_ENV", "development").lower() == "production":
+                raise RuntimeError("生产环境 ChromaDB 不可用") from ex
             logger.info(f"ChromaDB 服务不可用，使用本地嵌入式模式: {chroma_path}")
             chroma = chromadb.PersistentClient(
                 path=chroma_path,
@@ -245,8 +247,8 @@ class MemoryManager:
         pipe.setex(self.receipt_key(user_id, conv_id, request_id), 86400,
                    json.dumps({"message": message, "response": response}))
         if trace:
-            from core.redaction import redact
-            pipe.setex("trace:" + response["request_id"], 7 * 86400, json.dumps(redact(trace)))
+            from core.redaction import diagnostic_trace
+            pipe.setex("trace:" + response["request_id"], 7 * 86400, json.dumps(diagnostic_trace(trace)))
             pipe.lpush("trace:recent", response["request_id"])
             pipe.ltrim("trace:recent", 0, 199)
         await pipe.execute()

@@ -259,7 +259,7 @@ def test_mcp_tool_success_dimensions_timeout_and_breaker(spans, mode, expected, 
     assert span.attributes["app.outcome"] == expected
     assert span.attributes["app.tool.success"] is technical
     assert span.attributes["app.tool.result_success"] is business
-    assert result.success is (mode != "timeout")  # legacy technical-call semantics
+    assert result.success is (mode == "business")  # fallback payload is not successful retrieval evidence
     if mode in {"timeout", "fallback", "fallback_business"}:
         assert span.attributes["app.error_code"] == "TIMEOUT"
     if mode == "breaker":

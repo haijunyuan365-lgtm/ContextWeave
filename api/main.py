@@ -32,6 +32,7 @@ from observability import observed, request_context, correlation_ids, set_outcom
 from observability.bootstrap import configure_tracing, configure_logging, shutdown_tracing
 from observability.sanitization import hash_identifier
 from observability.api import build_router
+from core.redaction import diagnostic_trace
 
 load_dotenv()
 
@@ -308,10 +309,21 @@ async def access_control(request: HTTPRequest, call_next):
     except (ValueError, TypeError):
         return JSONResponse({"detail": "服务鉴权配置无效"}, status_code=503)
     request.state.account = account
-    if account is not None and request.url.path != "/health" and request.method != "OPTIONS":
+    path = request.url.path
+    history_route = path == "/trace/history" or path.startswith("/trace/history/") or path == "/trace/regressions" or path.startswith("/trace/regressions/")
+    dedicated_trace = False
+    if history_route:
+        import hmac
+        expected = os.getenv("TRACE_ADMIN_TOKEN", "").strip()
+        supplied = request.headers.get("authorization", "")
+        dedicated_trace = bool(expected) and hmac.compare_digest(supplied.encode(), ("Bearer " + expected).encode())
+    if account is not None and path != "/health" and request.method != "OPTIONS" and not dedicated_trace:
         if not account:
             return JSONResponse({"detail": "需要有效 Bearer Token"}, status_code=401)
-        reader = request.url.path in {"/chat", "/search", "/knowledge/stats", "/skills", "/mcp", "/mcp/"}
+        resource_path = path.split("/")
+        own_resource = (len(resource_path) >= 3 and resource_path[1] in {"memory", "experience"}
+                        and resource_path[2] == account["user_id"])
+        reader = own_resource or request.url.path in {"/chat", "/search", "/knowledge/stats", "/skills", "/mcp", "/mcp/"}
         if not reader and account["role"] != "admin":
             return JSONResponse({"detail": "该接口需要管理员权限"}, status_code=403)
     is_chat = request.url.path == "/chat" and request.method == "POST"
@@ -423,7 +435,7 @@ async def chat(req: ChatRequest, http_request: HTTPRequest):
         return JSONResponse(reply.model_dump(exclude_unset=True), status_code=503) if reply.status == "failed" else reply
     with request_context(orch_req.request_id):
         trace.get_current_span().set_attribute("app.request_id", orch_req.request_id)
-        with observed("chat.pipeline", span_type="request", **{"app.conversation.hash": hash_identifier(conv_id)}) as span:
+        with observed("chat.pipeline", span_type="request", **{"app.conversation.hash": hash_identifier(conv_id), "app.request.http_counted": _monitor is not None}) as span:
             try:
                 async with asyncio.timeout(50), _memory.conversation(req.user_id, conv_id):
                     receipt = await _memory.get_turn_receipt(req.user_id, conv_id, client_id)
@@ -574,7 +586,7 @@ async def get_tool_trace(request_id: str):
     return ToolTraceResponse(
         request_id=request_id,
         found=trace is not None,
-        trace=trace or {},
+        trace=diagnostic_trace(trace or {}),
     )
 
 
@@ -583,7 +595,8 @@ async def list_recent_tool_traces(limit: int = 20):
     """查看最近 N 次请求的工具调用明细。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    return RecentToolTracesResponse(items=await _memory.recent_traces(limit) if _memory else _orchestrator.get_recent_tool_traces(limit=limit))
+    from core.redaction import diagnostic_trace
+    return RecentToolTracesResponse(items=diagnostic_trace(await _memory.recent_traces(limit) if _memory else _orchestrator.get_recent_tool_traces(limit=limit)))
 
 
 @app.get("/metrics")
@@ -923,6 +936,9 @@ async def _cli():
         await mem.close()
 
 
+app.include_router(build_router(lambda: _evaluator))
+
+
 if __name__ == "__main__":
     if "--cli" in sys.argv:
         asyncio.run(_cli())
@@ -933,5 +949,3 @@ if __name__ == "__main__":
             port=int(os.getenv("API_PORT", "8000")),
             reload=os.getenv("APP_ENV") == "development",
         )
-
-app.include_router(build_router(lambda: _evaluator))

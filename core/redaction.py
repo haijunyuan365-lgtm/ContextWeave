@@ -12,3 +12,14 @@ def redact(value):
         text = re.sub(r'\bsk-[A-Za-z0-9_-]{12,}\b', '[REDACTED]', value)
         return re.sub(r'(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*', 'Bearer [REDACTED]', text)
     return value
+
+
+def diagnostic_trace(value):
+    """Persist structural diagnostics without prompts, tool inputs, outputs or error prose."""
+    if isinstance(value, dict):
+        return {key: ({str(k): "[REDACTED]" for k in item} if key == "input" and isinstance(item, dict)
+                      else "[REDACTED]" if key in {"input", "result", "response", "message", "content", "error"} and item
+                      else diagnostic_trace(item)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [diagnostic_trace(item) for item in value]
+    return redact(value)

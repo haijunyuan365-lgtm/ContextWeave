@@ -1291,7 +1291,11 @@ class AgentOrchestrator:
                 "app.agent.instance": f"{agent.agent_type.value}_{instance}", "app.agent.monitor_owner": getattr(self, "_metrics_owner", ""),
                 "app.agent.name": agent.agent_type.value, "app.agent.role": agent.profile.role,
                 "app.agent.requested_name": requested.value}) as span:
-            response = await agent.handle(req)
+            try:
+                response = await agent.handle(req)
+            except BaseException:
+                req.execution_records.append({"agent_type": agent.agent_type.value, "success": False, "fallback": fallback})
+                raise
             span.set_attribute("app.agent.success", response.success)
             span.set_attribute("app.agent.escalated", response.escalate)
             if not response.success:

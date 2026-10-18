@@ -23,7 +23,7 @@ from enum import Enum
 from typing import Any, Deque, Dict, List, Optional
 
 import httpx
-from prometheus_client import start_http_server
+from prometheus_client import start_http_server, REGISTRY, Histogram
 from observability.bootstrap import metrics_available
 from observability.metrics_projection import get_metrics_projection, AgentMetricsSnapshot, ToolMetricsSnapshot
 
@@ -128,6 +128,7 @@ class PerformanceMonitor:
         interval_s:       float = 10.0,
         webhook_url:      Optional[str] = None,
         prometheus_port:  Optional[int] = None,   # None = 不启动
+        registry=None,
         metrics_projection=None,
         stats_source: Optional[str] = None,
     ):
@@ -143,19 +144,31 @@ class PerformanceMonitor:
         self._task:        Optional[asyncio.Task] = None
 
         # Prometheus 指标（可选）
-        self._projection = metrics_projection or get_metrics_projection()
+        from observability.metrics_projection import MetricsProjection
+        self._registry = registry if registry is not None else getattr(metrics_projection, "registry", REGISTRY)
+        self._owned_metrics = registry is not None and metrics_projection is None
+        before = set(self._registry._collector_to_names)
+        self._projection = metrics_projection or (MetricsProjection(registry) if self._owned_metrics else get_metrics_projection())
+        self._http_server = None
+        self._prometheus_port = prometheus_port
+        self._registered = True
         self._capture_available = metrics_available
         self._stats_source = stats_source or os.getenv("ECHOMIND_MONITOR_STATS_SOURCE", "span").lower()
         if self._stats_source not in {"legacy", "shadow", "span"}:
             self._stats_source = "shadow"
         # Registered independently of the optional HTTP listener; /metrics always works.
         self._prom = self._projection.compatibility
+        self._prom = dict(self._prom)
+        self._owned_collectors = set(self._registry._collector_to_names) - before if self._owned_metrics else set()
+        if self._owned_metrics:
+            for kind, agents in getattr(self._orchestrator, "_pool", {}).items():
+                for i, agent in enumerate(agents):
+                    agent.stats.observer = self._prom["agent_latency_ms"].labels(agent=f"{kind.value}_{i}").observe
         self._comparison = {}
-        if prometheus_port:
-            self._setup_prometheus(prometheus_port)
+
 
     def _setup_prometheus(self, port: int) -> None:
-        start_http_server(port)
+        self._http_server, _ = start_http_server(port, registry=self._registry)
         logger.info(f"Prometheus 已启动: :{port}")
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
@@ -163,6 +176,12 @@ class PerformanceMonitor:
     async def start(self) -> None:
         if self._active:
             return
+        if not self._registered:
+            for metric in self._owned_collectors:
+                self._registry.register(metric)
+            self._registered = True
+        if self._prometheus_port:
+            self._setup_prometheus(self._prometheus_port)
         self._active = True
         self._task   = asyncio.create_task(self._loop())
         logger.info(f"Monitor 已启动，采集间隔 {self._interval}s")
@@ -175,6 +194,15 @@ class PerformanceMonitor:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
+        if self._http_server is not None:
+            await asyncio.to_thread(self._http_server.shutdown)
+            self._http_server.server_close()
+            self._http_server = None
+        if self._owned_metrics and self._registered:
+            for metric in self._owned_collectors:
+                self._registry.unregister(metric)
+            self._registered = False
 
     # ── 采集循环 ──────────────────────────────────────────────────────────────
 
@@ -216,7 +244,8 @@ class PerformanceMonitor:
                 self._prom["agent_success_rate"].labels(agent=self._projection.label("agent", agent_key)).set(sr)
                 self._prom["agent_avg_ms"].labels(agent=self._projection.label("agent", agent_key)).set(ms)
 
-            routing_penalties[agent_key] = self._routing_penalty(sr, ms)
+            routing_penalties[agent_key] = (self._routing_penalty(s["recent_success_rate"], s["recent_avg_ms"])
+                                          if s.get("recent_total", 0) >= 5 else 0.0)
 
         # ── 工具指标 ──────────────────────────────────────────────────────────
         for tool_name, s in tool_stats.items():

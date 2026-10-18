@@ -12,7 +12,7 @@ from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 from observability.policy import estimate_cost
 
 logger = logging.getLogger(__name__)
-LATENCY_BUCKETS_MS = (1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000)
+LATENCY_BUCKETS_MS = (1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 3000, 5000, 10000, 30000, 60000)
 RAG_SPANS = {"rag.pipeline", "rag.rewrite", "rag.query", "rag.hybrid", "rag.dense", "rag.bm25",
              "rag.rrf.stage1", "rag.rrf.stage2", "rag.mmr", "rag.rerank"}
 OUTCOMES = {"success", "error", "degraded", "skipped"}
@@ -47,6 +47,7 @@ class ToolMetricsSnapshot:
 
 class MetricsProjection:
     def __init__(self, registry=REGISTRY, *, max_owners=64, max_labels=64):
+        self.registry = registry
         self._lock = threading.RLock()
         self._max_owners = max_owners
         self._max_labels = max_labels
@@ -60,7 +61,8 @@ class MetricsProjection:
         self.capture_enabled = Gauge("contextweave_metrics_capture_enabled", "1 when full local Span capture is available", registry=registry)
         self.capture_enabled.set(1)
         self.compatibility = {
-            "requests_total": Counter("requests_total", "Completed accepted chat requests", registry=registry),
+            "requests_total": Counter("requests_total", "Accepted HTTP chat requests; standalone pipelines counted on completion", registry=registry),
+            "chat_latency_ms": Histogram("chat_latency_ms", "HTTP chat duration", ["status"], buckets=LATENCY_BUCKETS_MS, registry=registry),
             "agent_latency_ms": Histogram("agent_latency_ms", "Each actual Agent Span duration in ms", ["agent"], buckets=LATENCY_BUCKETS_MS, registry=registry),
             "agent_success_rate": Gauge("agent_success_rate", "Agent success rate (legacy definition)", ["agent"], registry=registry),
             "agent_avg_ms": Gauge("agent_avg_ms", "Cumulative Agent average latency in ms", ["agent"], registry=registry),
@@ -133,7 +135,8 @@ class MetricsProjection:
             outcome = "error" if span.status.status_code == StatusCode.ERROR else "success"
         with self._lock:
             if span.name == "chat.pipeline":
-                self.compatibility["requests_total"].inc()
+                if not attrs.get("app.request.http_counted", False):
+                    self.compatibility["requests_total"].inc()
                 self.requests.labels(outcome).inc()
                 self.request_duration.observe(duration)
             elif span.name == "agent.execute":

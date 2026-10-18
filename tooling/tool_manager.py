@@ -425,7 +425,7 @@ class MCPToolManager:
         config = getattr(self, "rag_config", RAGConfig())
         top_k = config.final_top_k if top_k is None else top_k
         if type(top_k) is not int or not 1 <= top_k <= 20:
-            raise ValueError("top_k must be between 1 and 20")
+            return ToolResult(False, [], tool_name, error="top_k must be between 1 and 20")
         timings: Dict[str, float] = {}
 
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
@@ -594,6 +594,7 @@ class MCPToolManager:
         return data
 
     @instrumented("rag.rerank", span_type="retrieval", propagate_degradation=True)
+    @ranked
     async def _rerank_with_status(self, query: str, items: List[Any], top_k: int) -> Tuple[List[Any], bool]:
         """
         用 LLM 对召回结果重新打分排序。

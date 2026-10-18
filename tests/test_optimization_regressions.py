@@ -55,11 +55,14 @@ async def test_intent_timeout_uses_fallback_instead_of_waiting_for_chat_deadline
 def test_production_storage_connection_failure_never_switches_to_local(cls, module, monkeypatch):
     import importlib
     target = importlib.import_module(module)
+    import sys
+    fake_chroma = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "chromadb", fake_chroma)
     monkeypatch.setenv("ECHOMIND_ENV", "production")
-    monkeypatch.setattr(target.chromadb, "Settings", Mock(return_value=None), raising=False)
-    monkeypatch.setattr(target.chromadb, "HttpClient", Mock(side_effect=RuntimeError("remote unavailable")), raising=False)
+    monkeypatch.setattr(fake_chroma, "Settings", Mock(return_value=None), raising=False)
+    monkeypatch.setattr(fake_chroma, "HttpClient", Mock(side_effect=RuntimeError("remote unavailable")), raising=False)
     local = Mock()
-    monkeypatch.setattr(target.chromadb, "PersistentClient", local, raising=False)
+    monkeypatch.setattr(fake_chroma, "PersistentClient", local, raising=False)
     if cls is MemoryManager:
         monkeypatch.setattr(target, "AsyncAnthropic", Mock())
         monkeypatch.setattr(target.redis, "from_url", Mock())
@@ -70,11 +73,14 @@ def test_production_storage_connection_failure_never_switches_to_local(cls, modu
 
 def test_empty_production_knowledge_base_does_not_seed_demo_policies(monkeypatch):
     import tooling.knowledge_base as module
+    import sys
+    fake_chroma = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "chromadb", fake_chroma)
     monkeypatch.setenv("ECHOMIND_ENV", "production")
-    collection = SimpleNamespace(count=lambda: 0)
+    collection = SimpleNamespace(count=lambda: 0, get=lambda **kwargs: {"ids": [], "documents": [], "metadatas": []})
     remote = SimpleNamespace(heartbeat=lambda: None, get_or_create_collection=lambda **kwargs: collection)
-    monkeypatch.setattr(module.chromadb, "Settings", Mock(return_value=None), raising=False)
-    monkeypatch.setattr(module.chromadb, "HttpClient", Mock(return_value=remote), raising=False)
+    monkeypatch.setattr(fake_chroma, "Settings", Mock(return_value=None), raising=False)
+    monkeypatch.setattr(fake_chroma, "HttpClient", Mock(return_value=remote), raising=False)
     seed = Mock()
     monkeypatch.setattr(KnowledgeBase, "_load_default_docs", seed)
     assert KnowledgeBase()._use_server
@@ -83,7 +89,11 @@ def test_empty_production_knowledge_base_does_not_seed_demo_policies(monkeypatch
 
 def test_retrieval_retains_document_identity_and_version():
     kb = KnowledgeBase.__new__(KnowledgeBase)
+    from tooling.rag_config import RAGConfig
+    import threading
+    kb.rag_config, kb._bm25_lock, kb._bm25, kb._bm25_items = RAGConfig(), threading.RLock(), None, ()
     kb._collection = SimpleNamespace(count=lambda: 1, query=lambda **kwargs: {
+        "ids": [["chunk-1"]],
         "documents": [["规则正文"]], "metadatas": [[{"title": "政策", "document_id": "doc-1", "version": "v1"}]],
         "distances": [[.2]],
     })
